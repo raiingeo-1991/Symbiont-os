@@ -1,9 +1,3 @@
-
----
-
-### 3. `MANIFEST.md` (Философский манифест)
-
-```markdown
 # Symbiont OS: The Sovereign Edge Manifesto
 
 ## I. The Fall of the Cloud
