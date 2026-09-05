@@ -64,33 +64,3 @@ class HybridSymbiontNode:
             self.append_memory("PEER_DISCOVERED", {"peer_id": peer_node_id})
 
     def offload_with_zkp(self, task_payload: dict, external_gateway: str) -> dict:
-        """
-        Bridges safely to external high-compute (cloud/Starlink) using a 
-        Zero-Knowledge Proof wrapper to protect owner identity and private history.
-        """
-        # Simulated ZKP generation verifying authorization without leaking state
-        zkp_proof = hashlib.sha256(f"{self.owner_id}-{time.time()}".encode()).hexdigest()[:32]
-        
-        print(f"[*] Offloading via [{external_gateway}] using ZKP proof [{zkp_proof}]...")
-        
-        simulated_result = {"status": "success", "output": "heavy_tensor_processed"}
-        self.append_memory("ZKP_EXTERNAL_SYNC", {"gateway": external_gateway})
-        
-        return simulated_result
-
-    def create_local_quest(self, quest_description: str, resource_reward: float) -> dict:
-        """Publishes a localized peer-to-peer labor quest within the mesh network."""
-        quest = {
-            "quest_id": hashlib.sha256(f"{time.time()}-{quest_description}".encode()).hexdigest()[:16],
-            "issuer": self.owner_id,
-            "description": quest_description,
-            "reward": resource_reward,
-            "status": "OPEN"
-        }
-        self.local_quests.append(quest)
-        self.append_memory("QUEST_CREATED", {"quest_id": quest["quest_id"]})
-        return quest
-
-    def export_sovereignty_backup(self) -> str:
-        """Generates the absolute physical backup string to store in a personal safe."""
-        return json.dumps(self.memory_chain, indent=2)
