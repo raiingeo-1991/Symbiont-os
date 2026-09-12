@@ -1,0 +1,264 @@
+# core/body.py
+# Тело Symbiont — продолжение ядра.
+# Ядро думает. Тело делает. Ядро просит — тело отвечает.
+
+import os
+import socket
+import threading
+import json
+
+
+class Body:
+    """Контракт тела. Что ядро может попросить."""
+
+    name = "abstract"
+
+    # --- Сенсоры и голос ---
+    def is_available(self): return False
+    def speak(self, text): return False
+    def listen(self, timeout=15): return ""
+    def battery(self): return 100.0
+    def notify(self, title, content): return False
+    def sensor(self, name="accelerometer"): return {}
+    def location(self): return {}
+    def vibrate(self, ms=200): return False
+    def info(self): return {"name": self.name, "available": self.is_available()}
+
+    # --- Сеть ---
+    def send_udp(self, ip, port, data): return False
+    def send_tcp(self, ip, port, data, timeout=8.0): return None
+    def start_udp_listener(self, port, callback): return False
+    def start_tcp_server(self, port, callback): return False
+    def stop_network(self): return False
+
+
+class NullBody(Body):
+    """Заглушка. Для Pydroid, ПК, сервера."""
+
+    name = "null"
+
+    def is_available(self): return True
+
+    def speak(self, text):
+        print(f"[voice] {text}")
+        return True
+
+    def battery(self): return 100.0
+
+
+class AndroidBody(Body):
+    """Тело для Termux. Голос, сенсоры, сеть — реальные."""
+
+    name = "android"
+
+    def __init__(self):
+        self._bridge = None
+        self._udp_sock = None
+        self._udp_thread = None
+        self._tcp_sock = None
+        self._tcp_thread = None
+        self._running = False
+        self._load_bridge()
+
+    def _load_bridge(self):
+        try:
+            from android_bridge import (
+                is_available, speak, listen, battery,
+                notify, sensor, location, vibrate,
+            )
+            self._bridge = {
+                "is_available": is_available,
+                "speak": speak,
+                "listen": listen,
+                "battery": battery,
+                "notify": notify,
+                "sensor": sensor,
+                "location": location,
+                "vibrate": vibrate,
+            }
+        except Exception:
+            self._bridge = None
+
+    # ---------- Сенсоры и голос ----------
+
+    def is_available(self):
+        if not self._bridge: return False
+        try: return bool(self._bridge["is_available"]())
+        except Exception: return False
+
+    def speak(self, text):
+        if not self._bridge: return False
+        try: return bool(self._bridge["speak"](text))
+        except Exception: return False
+
+    def listen(self, timeout=15):
+        if not self._bridge: return ""
+        try: return self._bridge["listen"](timeout=timeout) or ""
+        except Exception: return ""
+
+    def battery(self):
+        if not self._bridge: return 100.0
+        try: return float(self._bridge["battery"]())
+        except Exception: return 100.0
+
+    def notify(self, title, content):
+        if not self._bridge: return False
+        try: return bool(self._bridge["notify"](title, content))
+        except Exception: return False
+
+    def sensor(self, name="accelerometer"):
+        if not self._bridge: return {}
+        try: return self._bridge["sensor"](name=name) or {}
+        except Exception: return {}
+
+    def location(self):
+        if not self._bridge: return {}
+        try: return self._bridge["location"]() or {}
+        except Exception: return {}
+
+    def vibrate(self, ms=200):
+        if not self._bridge: return False
+        try: return bool(self._bridge["vibrate"](duration_ms=ms))
+        except Exception: return False
+
+    # ---------- Сеть ----------
+
+    def send_udp(self, ip, port, data):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            if not isinstance(data, bytes):
+                data = str(data).encode("utf-8")
+            s.sendto(data, (ip, int(port)))
+            s.close()
+            return True
+        except Exception:
+            return False
+
+    def send_tcp(self, ip, port, data, timeout=8.0):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((ip, int(port)))
+            if not isinstance(data, bytes):
+                data = str(data).encode("utf-8")
+            s.sendall(data)
+            resp = s.recv(65536)
+            s.close()
+            return resp
+        except Exception:
+            return None
+
+    def start_udp_listener(self, port, callback):
+        if self._udp_sock:
+            return True
+        try:
+            self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._udp_sock.bind(("", int(port)))
+            self._udp_sock.settimeout(1.0)
+        except Exception:
+            self._udp_sock = None
+            return False
+
+        self._running = True
+
+        def loop():
+            while self._running and self._udp_sock:
+                try:
+                    data, addr = self._udp_sock.recvfrom(8192)
+                    try:
+                        callback(data, addr)
+                    except Exception:
+                        pass
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+        self._udp_thread = threading.Thread(target=loop, daemon=True)
+        self._udp_thread.start()
+        return True
+
+    def start_tcp_server(self, port, callback):
+        if self._tcp_sock:
+            return True
+        try:
+            self._tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._tcp_sock.bind(("", int(port)))
+            self._tcp_sock.listen(8)
+            self._tcp_sock.settimeout(1.0)
+        except Exception:
+            self._tcp_sock = None
+            return False
+
+        self._running = True
+
+        def loop():
+            while self._running and self._tcp_sock:
+                try:
+                    conn, addr = self._tcp_sock.accept()
+                    threading.Thread(
+                        target=self._handle_tcp,
+                        args=(conn, addr, callback),
+                        daemon=True,
+                    ).start()
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+
+        self._tcp_thread = threading.Thread(target=loop, daemon=True)
+        self._tcp_thread.start()
+        return True
+
+    def _handle_tcp(self, conn, addr, callback):
+        try:
+            conn.settimeout(8.0)
+            data = conn.recv(65536)
+            if not data:
+                return
+            try:
+                resp = callback(data, addr)
+                if resp is not None:
+                    if not isinstance(resp, bytes):
+                        resp = str(resp).encode("utf-8")
+                    conn.sendall(resp)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def stop_network(self):
+        self._running = False
+        for s in (self._udp_sock, self._tcp_sock):
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        self._udp_sock = None
+        self._tcp_sock = None
+        return True
+
+
+def get_body(force=None):
+    """Выбор тела по среде.
+    force='null'    → NullBody
+    force='android' → AndroidBody
+    force=None      → авто."""
+    if force == "null":
+        return NullBody()
+    if force == "android":
+        return AndroidBody()
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        b = AndroidBody()
+        if b.is_available():
+            return b
+    return NullBody()
