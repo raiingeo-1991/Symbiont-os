@@ -61,7 +61,7 @@ flowchart TD
     N --> A
     A --> EX[EXPERIENCE]
     EX --> M
-## Что уже работает
+```
 
 - **Память** — SQLite + append-log. Связи, забывание, диалоги.
 - **Идентичность** — recovery phrase, multi-device, подписи.
