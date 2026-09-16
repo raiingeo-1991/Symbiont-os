@@ -22,8 +22,20 @@ from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+try:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from body import get_body
+    BODY = get_body()
+except Exception:
+    BODY = None
 
 CORE_VERSION = "11.0"
+
+try:
+    from llm_openai import OpenAIProvider
+except Exception:
+    OpenAIProvider = None
 ROOT_DIR = Path("symbiont_data")
 MAX_MEMORY_RESULTS = 12
 DEFAULT_FOOD_BUDGET = 10.0
@@ -757,6 +769,9 @@ class Bodies:
     def list(self): return dict(self.data.get("bodies", {}))
 
     def battery(self):
+        if BODY is not None:
+            try: return float(BODY.battery())
+            except Exception: pass
         with self.lock: return float(self.data.get("battery", 100.0))
 
     def set_battery(self, level):
@@ -1509,41 +1524,64 @@ class Symbiont:
             print("\n" + "!" * 60)
             print("  ЗАПИШИ RECOVERY PHRASE (больше не покажется):")
             print(f"  {self.identity.recovery_phrase}")
-            print("!" * 60 + "\n")
 
-    def _load_llm_config(self):
-        cfg = self.root / "llm.json"
-        if not cfg.exists(): return
-        try:
-            d = json.loads(cfg.read_text(encoding="utf-8"))
-            if d.get("provider") == "ollama":
-                self.llm_provider = OllamaProvider(d.get("url", DEFAULT_LLM_URL),
-                                                   d.get("model", DEFAULT_LLM_MODEL))
-                self.mind.connect_llm(self.llm_provider)
-        except Exception: pass
+
 
     def _save_llm_config(self, provider, url="", model=""):
         atomic_write(self.root / "llm.json",
                      json.dumps({"provider": provider, "url": url, "model": model},
                                 ensure_ascii=False, indent=2))
 
+    def _load_llm_config(self):
+        cfg = self.root / "llm.json"
+        if not cfg.exists():
+            return
+        try:
+            d = json.loads(cfg.read_text(encoding="utf-8"))
+            provider = d.get("provider", "")
+            url = d.get("url", DEFAULT_LLM_URL)
+            model = d.get("model", DEFAULT_LLM_MODEL)
+            if provider == "openai":
+                self.llm_provider = OpenAIProvider(url=url, model=model)
+                self.mind.connect_llm(self.llm_provider)
+            elif provider == "ollama":
+                self.llm_provider = OllamaProvider(url=url, model=model)
+                self.mind.connect_llm(self.llm_provider)
+        except Exception:
+            pass
+
     def llm_enable(self, url=DEFAULT_LLM_URL, model=DEFAULT_LLM_MODEL):
+        if OpenAIProvider is not None:
+            p = OpenAIProvider(url=url, model=model)
+            if p.is_available():
+                self.llm_provider = p
+                self.mind.connect_llm(p)
+                self._save_llm_config("openai", url, model)
+                return True, f"LLM: {url} / {model}"
         p = OllamaProvider(url=url, model=model)
-        if not p.is_available(): return False, f"Ollama недоступна по {url}"
-        self.llm_provider = p; self.mind.connect_llm(p)
+        if not p.is_available():
+            return False, f"LLM недоступен по {url}"
+        self.llm_provider = p
+        self.mind.connect_llm(p)
         self._save_llm_config("ollama", url, model)
         return True, f"Ollama: {url} / {model}"
 
+
     def llm_disable(self):
-        self.llm_provider = None; self.mind.connect_llm(None)
+        self.llm_provider = None
+        self.mind.connect_llm(None)
         self._save_llm_config("none")
 
     def llm_status(self):
-        if self.llm_provider is None: return {"enabled": False}
-        return {"enabled": True, "name": self.llm_provider.name,
-                "available": self.llm_provider.is_available(),
-                "url": getattr(self.llm_provider, "url", "?"),
-                "model": getattr(self.llm_provider, "model", "?")}
+        if self.llm_provider is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "name": self.llm_provider.name,
+            "available": self.llm_provider.is_available(),
+            "url": getattr(self.llm_provider, "url", "?"),
+            "model": getattr(self.llm_provider, "model", "?"),
+        }
 
     def speak(self, text): return self.mind.think(text)
 
@@ -1738,7 +1776,7 @@ class Shell:
             a = arg.strip().lower()
             if not a or a == "status":
                 print(json.dumps(self.sym.llm_status(), ensure_ascii=False, indent=2)); return True
-            if a == "on":
+            if a.startswith("on"):
                 parts = arg.split()
                 url = parts[1] if len(parts) > 1 else DEFAULT_LLM_URL
                 model = parts[2] if len(parts) > 2 else DEFAULT_LLM_MODEL
@@ -1891,6 +1929,48 @@ class Shell:
             valid, count = self.sym.journal.verify()
             print(f"Journal {'OK' if valid else 'FAILED'}: {count} events"); return True
 
+        if cmd in ("speak", "голос"):
+            if not arg: print("Usage: speak <text>"); return True
+            if BODY is not None and BODY.speak(arg): print(f"Произнесено: {arg}")
+            else: print("Тело не поддерживает голос.")
+            return True
+
+        if cmd in ("listen", "услышь"):
+            if BODY is None: print("Тело не подключено."); return True
+            text = BODY.listen()
+            if text:
+                print(f"Услышано: {text}")
+                self.sym.remember(text, kind="dialog", importance=5)
+                self.sym.mind.think(text)
+            else: print("Тишина.")
+            return True
+
+        if cmd == "notify":
+            if not arg: print("Usage: notify <text>"); return True
+            if BODY is not None and BODY.notify("Сим", arg): print("Уведомление отправлено.")
+            else: print("Уведомления недоступны.")
+            return True
+
+        if cmd == "sensor":
+            if BODY is None: print("Тело не подключено."); return True
+            print(json.dumps(BODY.sensor(arg or "accelerometer"), ensure_ascii=False, indent=2))
+            return True
+
+        if cmd == "location":
+            if BODY is None: print("Тело не подключено."); return True
+            print(json.dumps(BODY.location(), ensure_ascii=False, indent=2))
+            return True
+
+        if cmd == "vibrate":
+            if BODY is not None and BODY.vibrate(200): print("Вибрация.")
+            else: print("Вибрация недоступна.")
+            return True
+
+        if cmd == "body_info":
+            if BODY is None: print("Тело не подключено.")
+            else: print(json.dumps(BODY.info(), ensure_ascii=False, indent=2))
+            return True
+
         # Если не команда — как разговор
         mem_id = self.sym.remember(raw, kind="dialog", importance=5)
         links = self.sym.mind.build_links(mem_id, raw)
@@ -1977,10 +2057,9 @@ def self_test():
         assert sym.profile.traits()["острота"] > 0.4
 
         sym.bodies.set_battery(50)
-        assert 49 <= sym.bodies.battery() <= 51
+        assert 49 <= sym.bodies.data.get("battery", 0) <= 51
         sym.bodies.set_battery(10)
-        assert sym.bodies.battery() < BATTERY_MIN
-
+        assert sym.bodies.data.get("battery", 0) < BATTERY_MIN
         phrase = generate_recovery_phrase(12)
         assert validate_recovery_phrase(phrase) is True
         assert validate_recovery_phrase("неверная фраза") is False
@@ -2038,4 +2117,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(
+)
