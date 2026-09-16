@@ -1,0 +1,22 @@
+# Symbiont — личные данные. НИКОГДА не коммитить.
+symbiont_data/
+data/
+*.sqlite3
+*.log
+*.jsonl
+*.key
+sync_export.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Pydroid
+.pydroid/
+
+# Система
+.DS_Store
+Thumbs.db
