@@ -272,7 +272,7 @@ We don't erase history.
 
 ## What Already Exists
 
-Core in Python. **163 pages.** Works.
+Core in Python. **2000+ pages.** Works.
 
 Event journal with hash chain.
 
