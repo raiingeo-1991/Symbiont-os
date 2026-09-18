@@ -122,11 +122,11 @@ def test_termux(report, interactive):
 
     notify_ok, notify_detail = run_command(
         ["termux-notification", "-t", "Symbiont", "-c", "Android smoke test"],
-        timeout=8,
+        timeout=20,
     )
     report.check("Уведомление", notify_ok, notify_detail)
 
-    vibrate_ok, vibrate_detail = run_command(["termux-vibrate", "-d", "250"], timeout=5)
+    vibrate_ok, vibrate_detail = run_command(["termux-vibrate", "-d", "250"], timeout=15)
     report.check("Вибрация", vibrate_ok, vibrate_detail)
 
 

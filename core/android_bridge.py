@@ -4,16 +4,12 @@
 
 import subprocess
 import json
+import shutil
 
 
 def is_available():
     """Проверяет, работает ли Termux:API."""
-    try:
-        r = subprocess.run(["which", "termux-tts-speak"],
-                           capture_output=True, timeout=2)
-        return r.returncode == 0
-    except Exception:
-        return False
+    return shutil.which("termux-tts-speak") is not None
 
 
 def speak(text):
@@ -65,7 +61,7 @@ def notify(title, content):
         subprocess.run(["termux-notification",
                         "-t", str(title),
                         "-c", str(content)],
-                       timeout=5, capture_output=True)
+                       timeout=20, capture_output=True)
         return True
     except Exception:
         return False
@@ -95,7 +91,7 @@ def vibrate(duration_ms=200):
     """Вибрация."""
     try:
         subprocess.run(["termux-vibrate", "-d", str(duration_ms)],
-                       timeout=3, capture_output=True)
+                       timeout=15, capture_output=True)
         return True
     except Exception:
         return False

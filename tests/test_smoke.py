@@ -1,5 +1,6 @@
 import importlib
 import unittest
+from unittest.mock import patch
 
 
 class CoreImportTests(unittest.TestCase):
@@ -20,6 +21,13 @@ class CoreImportTests(unittest.TestCase):
 
         android = body.get_body(force="android")
         self.assertIsNotNone(android._bridge)
+
+    @patch("core.android_bridge.shutil.which", return_value="/data/data/com.termux/files/usr/bin/termux-tts-speak")
+    def test_android_bridge_detects_termux_api(self, which):
+        bridge = importlib.import_module("core.android_bridge")
+
+        self.assertTrue(bridge.is_available())
+        which.assert_called_once_with("termux-tts-speak")
 
 
 if __name__ == "__main__":
