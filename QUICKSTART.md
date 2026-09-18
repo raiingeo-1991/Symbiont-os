@@ -73,7 +73,7 @@ cd symbiont
 ## Шаг 4. Первый запуск (без LLM)
 
 ```bash
-python core/symbiont_core.py
+python symbiont_core.py
 ```
 
 Увидишь:
@@ -191,7 +191,7 @@ cd ~/symbiont
 ```
 
 ```bash
-python core/symbiont_core.py
+python symbiont_core.py
 ```
 
 Внутри Symbiont:

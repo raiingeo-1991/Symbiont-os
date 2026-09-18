@@ -62,7 +62,7 @@ class AndroidBody(Body):
 
     def _load_bridge(self):
         try:
-            from android_bridge import (
+            from core.android_bridge import (
                 is_available, speak, listen, battery,
                 notify, sensor, location, vibrate,
             )

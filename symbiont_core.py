@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 try:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from body import get_body
+    from core.body import get_body
     BODY = get_body()
 except Exception:
     BODY = None
@@ -33,7 +33,7 @@ except Exception:
 CORE_VERSION = "11.0"
 
 try:
-    from llm_openai import OpenAIProvider
+    from core.llm_openai import OpenAIProvider
 except Exception:
     OpenAIProvider = None
 ROOT_DIR = Path("symbiont_data")
@@ -2023,6 +2023,8 @@ class Shell:
 
 def self_test():
     import tempfile
+    assert BODY is not None, "Body module failed to load"
+    assert BODY.is_available() is True
     with tempfile.TemporaryDirectory() as temporary:
         sym = Symbiont(Path(temporary))
         assert sym.identity.id().startswith("sym-")
