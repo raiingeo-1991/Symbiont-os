@@ -250,6 +250,28 @@ listen
 
 ---
 
+## Автоматическая проверка Android
+
+После установки Termux:API запусти из папки проекта:
+
+```bash
+python scripts/android_smoke_test.py --interactive
+```
+
+Тест проверит Android-мост, батарею, голос, микрофон, уведомления,
+вибрацию, сохранение памяти и работу ядра без LLM.
+
+Если локальный `llama-server` уже запущен:
+
+```bash
+python scripts/android_smoke_test.py --interactive \
+  --llm-url http://127.0.0.1:11434 --llm-model qwen2.5
+```
+
+Все строки должны завершиться статусом `PASS`.
+
+---
+
 ## Решение проблем
 
 **`termux-tts-speak: command not found`**
