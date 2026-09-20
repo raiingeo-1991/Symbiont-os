@@ -262,3 +262,62 @@ def get_body(force=None):
         if b.is_available():
             return b
     return NullBody()
+# ============================================================
+# XLINK — Core/Body Adapter
+# ============================================================
+
+class XLink:
+    """
+    Lightweight adapter between Body and an external node layer.
+    Keeps the Core itself untouched.
+    """
+
+    def __init__(self, core=None):
+        self.core = core
+        self.connected = False
+        self.node_id = None
+        self.node_type = "node"
+
+    def connect(self, node_id):
+        node_id = str(node_id).strip()
+        if not node_id:
+            return False
+        self.node_id = node_id
+        self.connected = True
+        return True
+
+    def disconnect(self):
+        self.connected = False
+        self.node_id = None
+        return True
+
+    def attach_core(self, core):
+        self.core = core
+        return True
+
+    def status(self):
+        return {
+            "module": "xlink",
+            "connected": self.connected,
+            "node_id": self.node_id,
+            "node_type": self.node_type,
+            "core_attached": self.core is not None,
+        }
+
+    def send_event(self, event, data=None):
+        if not self.connected:
+            return False
+
+        data = data or {}
+
+        if self.core is not None and hasattr(self.core, "remember"):
+            self.core.remember(
+                f"Node event: {event} | {data}",
+                kind="external",
+            )
+
+        return True
+
+
+def get_xlink(core=None):
+    return XLink(core)
