@@ -1,35 +1,40 @@
-# SYMBIONT — QUICKSTART
+=== SYMBIONT — ЗАПУСК ===
 
-A complete step-by-step path from first installation to a working Symbiont.
+1. Termux → сеанс 1 (мозг):
 
-This guide is intentionally practical.
+cd ~/llama.cpp
+./build/bin/llama-server -m ~/models/qwen2.5-1.5b-instruct-q4_k_m.gguf --port 11434
 
-For the project vision, see [README](README.md).
+Ждёшь: listening on http://127.0.0.1:11434
+Не закрываешь.
 
-For the development path, see [ROADMAP](ROADMAP.md).
+2. Termux → свайп влево → New session (Symbiont):
 
----
+cd ~/symbiont
+python core/symbiont_core.py
 
-# Stage 1 — Requirements
+3. В Symbiont:
 
-You need:
+llm on http://localhost:11434 qwen2.5
+proactive on
+listen on
 
-- Python 3
-- Git
-- Android + Termux, or a compatible Linux environment
-- Internet connection for the initial download
-- Approximately 1 GB of free storage for the basic setup
+4. Termux → ещё один сеанс (защита):
 
-An external AI model is not required.
+termux-wake-lock
 
-The Core can run without an LLM.
+5. Телефон на зарядку. Не закрывать Termux.
 
----
+=== ПРОВЕРКА ===
 
-# Stage 2 — Install Python and Git
+say привет
+proactive now
+speak Привет из Symbiont
+memory
+exit
 
-On Termux:
+=== ЕСЛИ ЧТО-ТО НЕ ТАК ===
 
-```bash
-pkg update
-pkg install python git
+cd: no such file → папки нет
+llama-server: not found → мозг не собран
+LLM недоступен → мозг не запущен
