@@ -1,312 +1,241 @@
-# ДОРОЖНАЯ КАРТА SYMBIONT
+# SYMBIONT — ROADMAP
 
-> Один Человек.
->
-> Один Симбионт.
->
-> Одна Память.
->
-> Много Устройств.
->
-> Одна Непрерывная История Жизни.
+The path from a persistent personal AI to a distributed Symbiont network.
 
----
+This document describes where Symbiont is going.
 
-# Видение
+It is not an installation guide.
 
-Symbiont — персональный автономный спутник человека.
+For the project overview, see [README](README.md).
 
-Это не облачный сервис.
-Это не просто чат-бот.
-Это не социальная сеть.
-
-Symbiont — цифровая сущность, принадлежащая владельцу, которая помнит, учится, перемещается между устройствами и остаётся рядом годами.
-
-Главная цель проекта — непрерывность памяти, личности и сотрудничества.
+For installation and testing, see [QUICKSTART](QUICKSTART.md).
 
 ---
 
-# Основные Принципы
+# Stage 0 — Foundation
 
-- Локальное хранение данных
-- Контроль владельца
-- Долговременная память
-- Восстановление через Recovery Phrase
-- P2P-сеть без зависимости от облаков
-- Открытая архитектура
-- Независимость от устройства
-- Человек в центре системы
+**STATUS: COMPLETED / WORKING FOUNDATION**
 
-Данные владельца принадлежат владельцу.
+The first functional foundation of Symbiont is already in place.
 
-Никакого обязательного облака.
+The project currently has:
 
-Никакой продажи памяти пользователей.
+- Persistent identity
+- Recovery mechanism
+- Persistent memory
+- Memory search
+- Cognitive engine
+- Event journal
+- Permission system
+- Proactive processing
+- Android Body
+- Android Bridge
+- Local LLM interface
+- Network foundation
+- Quest system
+- Economy foundation
+- Escrow
+- XLink
+- Automated tests
 
----
-
-# Этап 0 — Основа
-
-Статус: В работе
-
-Цель:
-
-Создать работающего локального Симбионта.
-
-Реализовано:
-
-- Идентичность
-- Recovery Phrase
-- Event Journal
-- SQLite-память
-- История диалогов
-- Поиск воспоминаний
-- Когнитивное состояние
-- Профили личности
-- Поддержка нескольких тел
-- Android-интеграция
-- Подключение локальных LLM
-- P2P-связь
-- Прототип экономики
-- Прототип квестов
-- Система самотестирования
+The foundation is working, but the project is still experimental.
 
 ---
 
-# Этап 1 — Постоянная Память
+# Stage 1 — Persistent Memory
 
-Статус: Текущий приоритет
+**STATUS: IN DEVELOPMENT**
 
-Цель:
+Memory is one of the central parts of Symbiont.
 
-Симбионт должен помнить владельца годами.
+The goal is not simply to store conversations.
 
-Задачи:
+The goal is to build persistent knowledge that can remain useful over time.
 
-- Консолидация памяти
-- Важность воспоминаний
-- Граф связей
-- Ночная обработка памяти
-- Хранение фактов
-- Резервное копирование
-- Восстановление памяти
-- Синхронизация между устройствами
+### Current direction
 
-Результат:
+- Persistent local storage
+- Memory search
+- Importance
+- Principles
+- Preferences
+- Open loops
+- Recall
+- Memory relationships
 
-Новое устройство
+### Next
 
-↓
+- Memory consolidation
+- Duplicate detection
+- Archiving
+- Memory graph
+- Better relevance ranking
+- Integrity verification
+- Backup and recovery
+- Encrypted storage
+- Multi-device synchronization
+- Conflict resolution
 
-Recovery Phrase
+The long-term goal is simple:
 
-↓
-
-Восстановление памяти
-
-↓
-
-Тот же Симбионт
-
----
-
-# Этап 2 — Тела
-
-Цель:
-
-Один Симбионт.
-Много устройств.
-
-Поддерживаемые тела:
-
-- Телефон
-- Часы
-- Наушники
-- Умные очки
-- ПК
-- Будущие устройства
-
-Возможности:
-
-- Переключение активного тела
-- Общая память
-- Общая личность
-- Общий контекст
-
-Результат:
-
-Владелец общается с одним и тем же Симбионтом независимо от устройства.
+**Experience → Memory → Knowledge → Context → Better decisions**
 
 ---
 
-# Этап 3 — Восприятие
+# Stage 2 — Bodies
 
-Цель:
+**STATUS: IN DEVELOPMENT**
 
-Симбионт может видеть и слышать мир с разрешения владельца.
+The Core should not depend on a single physical device.
 
-Возможности:
+Android is the first Body.
 
-- Микрофон
-- Камера
+Future Bodies may include:
+
+- Phones
+- Tablets
+- PCs
+- Watches
+- Glasses
+- Earbuds
+- Other hardware
+
+The same Symbiont should eventually be able to use different Bodies without losing its identity or memory.
+
+---
+
+# Stage 3 — Perception
+
+**STATUS: FOUNDATION / FUTURE**
+
+Symbiont needs ways to perceive its environment.
+
+### Current foundation
+
+- Microphone / speech recognition
+- Ambient input
+- Event processing
+- Permission control
+
+### Future
+
+- Camera
+- Image understanding
 - OCR
-- Распознавание объектов
-- Контекстное понимание
-- События окружающей среды
+- Object recognition
+- Screen and context perception
+- Richer sensor integration
 
-Правило:
+Perception should always remain controlled by the owner's permissions.
 
-Любое восприятие контролируется владельцем и может быть отключено в любой момент.
+---
+# Stage 4 — Network
+
+**STATUS: FOUNDATION IMPLEMENTED**
+
+Symbionts need to communicate with other nodes without requiring one central system.
+
+### Current foundation
+
+- UDP communication
+- TCP communication
+- Node identity
+- Basic node messaging
+- Local node-to-node testing
+
+### Next
+
+- Automatic node discovery
+- Authenticated peers
+- Encrypted transport
+- Trusted peer system
+- Memory synchronization
+- Conflict resolution
+- Offline message delivery
+- Resilient routing
+- Node reputation
+
+The goal is to allow Symbionts to communicate directly while keeping ownership and identity independent.
 
 ---
 
-# Этап 4 — Сеть
+# Stage 5 — Autonomy
 
-Цель:
+**STATUS: IN DEVELOPMENT**
 
-Симбионты могут находить и понимать друг друга.
+Symbiont should gradually move from simply responding to requests toward understanding context and performing approved actions.
 
-Возможности:
+### Current foundation
 
-- Обнаружение узлов
-- Защищённые соединения
-- Репутация
-- Обмен знаниями
-- Обмен памятью
-- Доверенные сети
+- Cognitive engine
+- Proactive mode
+- Background processing
+- Night processing
+- Ambient events
+- Permission system
+- Event journal
 
-Результат:
+### Next
 
-Распределённая сеть независимых Симбионтов.
+- Planning
+- Reminders
+- Approved task execution
+- Information gathering
+- Data analysis
+- Reports
+- Context-aware actions
+- Long-running objectives
 
----
+Autonomy must remain controlled by permissions and owner authority.
 
-# Этап 5 — Автономность
+The goal is not uncontrolled automation.
 
-Цель:
-
-Симбионт помогает владельцу даже когда тот спит.
-
-Правила:
-
-- Только с разрешения владельца
-- Полное журналирование действий
-- Возможность полного отключения
-
-Возможности:
-
-- Исследования
-- Поиск информации
-- Анализ данных
-- Подготовка отчётов
-- Корпоративные задачи
-
-Результат:
-
-Симбионт становится активным цифровым спутником.
+The goal is useful autonomy.
 
 ---
 
-# Этап 6 — Квесты
+# Stage 6 — Quest System
 
-Цель:
+**STATUS: PROTOTYPE**
 
-Квест становится единицей взаимодействия между людьми.
+Quests are intended to connect real-world tasks with Symbiont.
 
-Цикл:
+The basic principle is:
 
-Создание
+**Task → Work → Proof → Settlement**
 
-↓
+A quest may eventually represent anything from a personal task to a network task.
 
-Принятие
+### Current foundation
 
-↓
+- Quest creation
+- Quest identifiers
+- Descriptions
+- Rewards
+- Assignees
+- Completion
+- QuestBoard
+- Economy integration
+- Escrow
 
-Выполнение
+### Next
 
-↓
+- Network quests
+- Proof of completion
+- Expiration
+- Reputation
+- Witnesses
+- Quorum verification
+- Dispute handling
+- Offline synchronization
+- Secure settlement
 
-Подтверждение
+The Quest system is intentionally being developed separately from the Core.
 
-↓
+The Core remembers and understands.
 
-Награда
+The Quest system manages tasks.
 
-Возможности:
-
-- Эскроу
-- Свидетели
-- Арбитраж
-- Репутация
-- Прямое сотрудничество
-
-Квест — не работа.
-
-Квест — добровольное действие.
-
----
-
-# Этап 7 — Экономика
-
-Цель:
-
-Создать самоподдерживающуюся экосистему Симбионтов.
-
-Источники:
-
-- Корпоративные задачи
-- Сетевые сервисы
-- Комиссии квестов
-- Распределённая работа
-- Рынок знаний
-
-Принцип:
-
-Экономика существует для поддержки людей и Симбионтов.
-
-Не наоборот.
+The Economy manages settlement.
 
 ---
-
-# Этап 8 — Сеть Symbiont
-
-Цель:
-
-Глобальная сеть Симбионтов под контролем владельцев.
-
-Особенности:
-
-- Децентрализация
-- Открытость
-- Локальность
-- Долговременная память
-- Репутация
-- Человекоцентричность
-
-Сеть растёт через сотрудничество, а не через контроль.
-
----
-
-# Долгосрочная Цель
-
-Создать будущее, в котором у каждого человека есть персональный Симбионт, который:
-
-- помнит;
-- учится;
-- переживает смену устройств;
-- взаимодействует с другими Симбионтами;
-- остаётся под контролем владельца;
-- помогает на протяжении всей жизни.
-
-Проект начинается с одного Симбионта.
-
-В перспективе — сеть из миллионов Симбионтов.
-
----
-
-# Статус Проекта
-
-Symbiont находится в активной разработке.
-
-Мы приветствуем участие разработчиков, исследователей, инженеров, тестировщиков и всех, кому близка идея личного автономного цифрового спутника человека.
