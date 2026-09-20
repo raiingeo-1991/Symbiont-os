@@ -239,3 +239,273 @@ The Quest system manages tasks.
 The Economy manages settlement.
 
 ---
+# Stage 7 — Economy
+
+**STATUS: PROTOTYPE**
+
+The Economy layer provides the foundation for task-based rewards and future distributed settlement.
+
+### Current foundation
+
+- Wallet
+- Balance
+- Rewards
+- Persistent economy state
+- Escrow
+- Reserve
+- Release
+- Refund
+- Freeze
+- Unique quest operation IDs
+
+The current Escrow lifecycle supports:
+
+**Available → Escrow → Release**
+
+or:
+
+**Available → Escrow → Refund**
+
+An operation can also enter:
+
+**Escrow → Frozen**
+
+before being released or refunded.
+
+### Next
+
+- Network settlement
+- Transaction verification
+- Replay protection
+- Distributed accounting
+- Proof-based payments
+- Dispute handling
+- Multi-node settlement
+- Transaction history
+- Stronger cryptographic integrity
+
+The current Economy is experimental.
+
+It is not a production financial system.
+
+---
+
+# Stage 8 — External Node Types
+
+**STATUS: FUTURE ARCHITECTURE**
+
+The Symbiont protocol is being designed so that different types of nodes can interact without changing the Core.
+
+Future transactions can contain:
+
+- `creator_node`
+- `worker_node`
+- `creator_type`
+- `worker_type`
+
+The current model is:
+
+**personal → personal**
+
+Future combinations may include:
+
+**personal → external**
+
+**external → personal**
+
+**external → external**
+
+The important architectural rule is:
+
+**External node logic stays outside the Core.**
+
+The Core remains responsible for:
+
+- Memory
+- Identity
+- Cognition
+- Internal continuity
+
+This allows the system to evolve without turning the Core into a collection of external business or hardware logic.
+
+---
+
+# Stage 9 — Scaling
+
+**STATUS: FUTURE**
+
+Scaling comes after the fundamental architecture becomes reliable.
+
+Planned testing levels include:
+
+**10 → 50 → 100 → 500 → 1,000 → 3,000 → 10,000 → 30,000+ nodes**
+
+Future tests will examine:
+
+- Memory load
+- Network traffic
+- Concurrent nodes
+- Quest traffic
+- Economy operations
+- Synchronization
+- CPU usage
+- RAM usage
+- Failure recovery
+
+Scaling is not the current primary development target.
+
+The priority is first to make the foundation reliable.
+
+---
+# Stage 10 — Security
+
+**STATUS: CONTINUOUS DEVELOPMENT**
+
+Security is not a final feature.
+
+It is a permanent part of Symbiont development.
+
+### Current foundation
+
+- Recovery mechanism
+- Node identity
+- Permission system
+- Event journal
+- Persistent state
+- Operation identifiers
+- Escrow state protection
+
+### Next
+
+- Cryptographic identity verification
+- Encrypted transport
+- Authenticated peers
+- Secure key storage
+- Replay protection
+- Transaction signatures
+- Memory integrity verification
+- Secure synchronization
+- Threat modeling
+- Security testing
+- Recovery procedures
+
+The goal is to keep the owner in control of the Symbiont and its capabilities.
+
+---
+
+# Stage 11 — Portability
+
+**STATUS: FUTURE**
+
+A Symbiont should not be permanently tied to one device.
+
+The long-term goal is to move the same Symbiont between different Bodies while preserving its continuity.
+
+A future migration may look like:
+
+**Device A → Secure Recovery → Device B**
+
+The following should eventually be preserved:
+
+- Identity
+- Memory
+- History
+- Principles
+- Preferences
+- Relationships
+- Configuration
+- Authorized capabilities
+
+The hardware may change.
+
+The Symbiont should remain.
+
+---
+
+# Stage 12 — Symbiont Network
+
+**STATUS: LONG-TERM**
+
+The long-term vision is a network of autonomous Symbionts.
+
+The network may eventually support:
+
+- Peer-to-peer communication
+- Distributed tasks
+- Cooperation between Symbionts
+- Reputation
+- Quests
+- Verified work
+- Economic settlement
+- Shared infrastructure
+- Autonomous agents
+
+The network should not require every Symbiont to depend permanently on one central system.
+
+The objective is a network where people retain ownership of their own Symbionts.
+
+---
+
+# Current Development Priority
+
+The immediate priority is not maximum scale.
+
+The priority is a reliable foundation.
+
+The current order is:
+
+1. Persistent memory
+2. Identity and recovery
+3. Core stability
+4. Body and Bridge
+5. Android integration
+6. Secure networking
+7. Quest reliability
+8. Economy reliability
+9. Portability
+10. Security
+11. Multi-device operation
+12. Large-scale networking
+
+---
+
+# The Architecture Must Remain Stable
+
+Symbiont should grow by adding capabilities around the Core rather than constantly rewriting the Core.
+
+The principle is:
+
+**Core → Bridge → Body → Device**
+
+The Core remains responsible for:
+
+- Memory
+- Identity
+- Cognition
+- Continuity
+
+The Body provides capabilities.
+
+The Bridge connects them.
+
+This separation allows Symbiont to evolve without making the Core dependent on a particular device, operating system or AI model.
+
+---
+
+# Long-Term Direction
+
+The development path is:
+
+**Personal AI → Persistent Symbiont → Multi-device Symbiont → Networked Symbionts → Distributed Symbiont Ecosystem**
+
+The exact implementation will evolve as the project is tested.
+
+The architecture is designed to evolve with it.
+
+---
+
+# Final Principle
+
+The device belongs to the Symbiont.
+
+The Symbiont belongs to its owner.
