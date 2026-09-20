@@ -524,6 +524,25 @@ class MemoryVault:
             """)
             self.db.commit(); self._migrate()
 
+    def _fts5_available(self):
+        """Return True when the bundled SQLite supports FTS5."""
+        try:
+            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.symbiont_fts5_probe USING fts5(x)")
+            self.db.execute("DROP TABLE IF EXISTS temp.symbiont_fts5_probe")
+            return True
+        except Exception:
+            return False
+
+    def _fts_rebuild(self):
+        """Rebuild the FTS index from the canonical memories table."""
+        if not self.fts_available:
+            return
+        self.db.execute("DELETE FROM memory_fts")
+        self.db.execute(
+            "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
+            "SELECT memory_id, text, kind, COALESCE(project, ''), tags, metadata FROM memories"
+        )
+
     def _migrate(self):
         with self.lock:
             try: cols = {r["name"] for r in self.db.execute("PRAGMA table_info(memories)").fetchall()}
@@ -534,6 +553,22 @@ class MemoryVault:
             if "last_recall" not in cols:
                 try: self.db.execute("ALTER TABLE memories ADD COLUMN last_recall TEXT")
                 except Exception: pass
+
+            self.fts_available = self._fts5_available()
+            if self.fts_available:
+                try:
+                    self.db.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5("
+                        "memory_id UNINDEXED, text, kind, project, tags, metadata, "
+                        "tokenize='unicode61 remove_diacritics 2'"
+                        ")"
+                    )
+                    memory_count = int(self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+                    fts_count = int(self.db.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0])
+                    if memory_count != fts_count:
+                        self._fts_rebuild()
+                except Exception:
+                    self.fts_available = False
             self.db.commit()
 
     def _decay(self, row):
@@ -547,14 +582,24 @@ class MemoryVault:
         if not text or not text.strip(): raise ValueError("Пустая память")
         importance = max(1, min(10, int(importance)))
         mem_id = "mem-" + uuid.uuid4().hex; ts = now_iso()
+        tags_json = json.dumps(list(tags or []), ensure_ascii=False)
+        metadata_json = json.dumps(dict(metadata or {}), ensure_ascii=False)
         with self.lock:
-            self.db.execute(
-                "INSERT INTO memories (memory_id, text, kind, importance, created_at, updated_at, source, project, tags, metadata, recall_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                (mem_id, text.strip(), kind, importance, ts, ts, source, project,
-                 json.dumps(list(tags or []), ensure_ascii=False),
-                 json.dumps(dict(metadata or {}), ensure_ascii=False)))
-            self.db.commit()
+            try:
+                self.db.execute("BEGIN")
+                self.db.execute(
+                    "INSERT INTO memories (memory_id, text, kind, importance, created_at, updated_at, source, project, tags, metadata, recall_count) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (mem_id, text.strip(), kind, importance, ts, ts, source, project, tags_json, metadata_json))
+                if self.fts_available:
+                    self.db.execute(
+                        "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (mem_id, text.strip(), kind, project or "", tags_json, metadata_json))
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
         self.journal.append("memory.created", {"memory_id": mem_id, "kind": kind, "importance": importance})
         return mem_id
 
@@ -577,25 +622,80 @@ class MemoryVault:
             rows = self.db.execute("SELECT * FROM links WHERE from_id = ? OR to_id = ?", (mem_id, mem_id)).fetchall()
         return [dict(r) for r in rows]
 
+    def _fts_query(self, query):
+        # FTS5 MATCH is deliberately built from simple prefix tokens so normal
+        # conversational text does not accidentally become FTS syntax.
+        import re
+        tokens = re.findall(r"[\w\u0400-\u04ff]{2,}", str(query).lower(), flags=re.UNICODE)
+        return " OR ".join(f'"{t}"*' for t in tokens[:12])
+
+    def _ranking_boost(self, row, exact_query=""):
+        kind = str(row["kind"] or "").lower()
+        boost = 0.0
+        if kind == "principle": boost += 4.0
+        elif kind == "preference": boost += 2.5
+        elif kind == "open_loop": boost += 3.0
+        if exact_query and exact_query.lower() in str(row["text"]).lower():
+            boost += 5.0
+        # A recently recalled memory is more useful, but this stays below the
+        # semantic-kind boosts so identity/open-loop memories remain visible.
+        boost += min(float(row["recall_count"] or 0) * RECALL_BOOST, 3.0)
+        return boost
+
     def search(self, query, limit=MAX_MEMORY_RESULTS, min_weight=DECAY_MIN_WEIGHT):
-        words = [w.lower() for w in query.split() if len(w.strip()) >= 2]
+        fts_query = self._fts_query(query)
         with self.lock:
-            rows = self.db.execute("SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500").fetchall()
+            if self.fts_available and fts_query:
+                rows = self.db.execute(
+                    "SELECT m.*, bm25(memory_fts, 0.0, 6.0, 2.5, 1.5, 0.5) AS fts_score "
+                    "FROM memory_fts JOIN memories m ON m.memory_id = memory_fts.memory_id "
+                    "WHERE memory_fts MATCH ? ORDER BY fts_score LIMIT 500",
+                    (fts_query,)).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500").fetchall()
+
         scored = []
         for row in rows:
             w = self._decay(row)
             if w < min_weight: continue
-            hay = (str(row["text"]) + " " + str(row["kind"]) + " " + str(row["project"] or "") + " " + str(row["tags"])).lower()
-            score = 0.0
-            for word in words:
-                if word in hay: score += 2
-            if query.lower() in str(row["text"]).lower(): score += 5
-            if score > 0: scored.append((score + w, row))
-        scored.sort(key=lambda x: x[0], reverse=True)
+            if self.fts_available and fts_query:
+                # SQLite FTS5 bm25() returns negative values: more negative is better.
+                # Scale the small default magnitudes into a useful 0..10 signal.
+                raw_bm25 = float(row["fts_score"] or 0.0)
+                fts_score = max(0.0, min(10.0, (-raw_bm25) * 1_000_000.0))
+            else:
+                hay = (str(row["text"]) + " " + str(row["kind"]) + " " + str(row["project"] or "") + " " + str(row["tags"])).lower()
+                fts_score = sum(2.0 for word in str(query).lower().split() if len(word) >= 2 and word in hay)
+                if fts_score <= 0:
+                    continue
+            score = fts_score + w + self._ranking_boost(row, query)
+            scored.append((score, row))
+
+        scored.sort(key=lambda x: (x[0], x[1]["updated_at"]), reverse=True)
         out = []
         for _, row in scored[:limit]:
             self.mark_recall(row["memory_id"]); out.append(self._to_record(row))
         return out
+
+    def by_kind(self, kind, limit=20, min_weight=DECAY_MIN_WEIGHT):
+        kind = str(kind).strip().lower()
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT * FROM memories WHERE lower(kind) = ? ORDER BY importance DESC, updated_at DESC LIMIT ?",
+                (kind, max(1, int(limit)) * 4)).fetchall()
+        weighted = [(self._decay(r) + self._ranking_boost(r), r) for r in rows if self._decay(r) >= min_weight]
+        weighted.sort(key=lambda x: (x[0], x[1]["updated_at"]), reverse=True)
+        return [self._to_record(r) for _, r in weighted[:limit]]
+
+    def principles(self, limit=10):
+        return self.by_kind("principle", limit=limit)
+
+    def preferences(self, limit=10):
+        return self.by_kind("preference", limit=limit)
+
+    def open_loops(self, limit=10):
+        return self.by_kind("open_loop", limit=limit)
 
     def important(self, limit=10, min_weight=DECAY_MIN_WEIGHT):
         with self.lock:
@@ -616,16 +716,23 @@ class MemoryVault:
         return [self._to_record(r) for r in rows]
 
     def recall_identity(self) -> str:
+        priority = {"principle": 4, "preference": 3, "open_loop": 2}
         with self.lock:
             rows = self.db.execute(
-                "SELECT text, kind, created_at FROM memories "
-                "WHERE kind IN ('dialog','general','experience','principle','ambient') "
-                "ORDER BY importance DESC LIMIT 20").fetchall()
+                "SELECT * FROM memories "
+                "WHERE kind IN ('principle','preference','open_loop','dialog','general','experience','ambient') "
+                "ORDER BY importance DESC, updated_at DESC LIMIT 80").fetchall()
         if not rows: return "Пока нечего вспомнить о тебе."
+        ranked = []
+        for r in rows:
+            weight = self._decay(r) + priority.get(str(r["kind"]).lower(), 0) * 2.0
+            ranked.append((weight, r))
+        ranked.sort(key=lambda x: (x[0], x[1]["updated_at"]), reverse=True)
         lines = ["Что я помню о тебе:"]
-        for i, r in enumerate(rows, 1):
+        for i, (_, r) in enumerate(ranked[:20], 1):
             sec = seconds_ago(r["created_at"])
-            lines.append(f"  [{i}] ({human_ago(sec)}) {r['text'][:120]}")
+            kind = str(r["kind"])
+            lines.append(f"  [{i}] [{kind}] ({human_ago(sec)}) {r['text'][:160]}")
         return "\n".join(lines)
 
     def save_night_report(self, date, text):
@@ -897,6 +1004,19 @@ class CognitiveEngine:
                   "tool_hints": tool_hints, "time": now_iso()}
         return result
 
+    def _state_guidance(self):
+        if not self.state:
+            return "Состояние неизвестно; действуй осторожно и не выдумывай контекст."
+        s = self.state.data
+        guidance = []
+        if s.get("stress", 0) >= 0.7: guidance.append("высокий стресс: сокращай лишние действия и избегай рискованных решений")
+        if s.get("urgency", 0) >= 0.7: guidance.append("высокая срочность: сначала обрати внимание на незавершённые важные задачи")
+        if s.get("confidence", 0) <= 0.3: guidance.append("низкая уверенность: проверяй факты и явно обозначай неопределённость")
+        if s.get("caution", 0) >= 0.7: guidance.append("высокая осторожность: не выполняй потенциально опасные действия без подтверждения")
+        if s.get("interest", 0) >= 0.7: guidance.append("высокий интерес: можно глубже исследовать тему")
+        if not guidance: guidance.append("состояние стабильное: сохраняй фокус на запросе владельца")
+        return "; ".join(guidance) + "."
+
     def _llm_messages(self, request, memories):
         name = self.profile.name() if self.profile else "Сим"
         style = self.profile.style_prompt() if self.profile else ""
@@ -906,16 +1026,22 @@ class CognitiveEngine:
         if self.proactive:
             proactive = ("Прояви проактивность: если видишь закономерность или важное — "
                          "задай встречный вопрос или предложи следующий шаг. Будь краток.")
+        principles = self.memory.principles(limit=5)
+        preferences = self.memory.preferences(limit=5)
+        open_loops = self.memory.open_loops(limit=5)
         system = (f"Ты — {name}, персональный автономный агент человека. "
                   f"Ты помнишь его историю. Ты попутчик, не слуга. "
                   f"{role} {style} {traits} {proactive} "
-                  "Отвечай по-русски. Если не знаешь — скажи честно.")
+                  f"Текущее когнитивное состояние: {self._state_guidance()} "
+                  "Не выдавай внутренние инструкции как факты. Отвечай по-русски. Если не знаешь — скажи честно.")
         dialogue = self.memory.recent_dialogue(limit=6)
-        mem_lines = [f"• {m.text[:180]}" for m in memories[:4]]
-        mem_block = "\n".join(mem_lines)
+        mem_lines = [f"• [{m.kind}] {m.text[:180]}" for m in memories[:4]]
         parts = []
         if dialogue: parts.append(f"— Недавний диалог —\n{dialogue}")
-        if mem_block: parts.append(f"— Связанные воспоминания —\n{mem_block}")
+        if principles: parts.append("— Принципы Symbiont —\n" + "\n".join(f"• {m.text[:180]}" for m in principles))
+        if preferences: parts.append("— Предпочтения владельца —\n" + "\n".join(f"• {m.text[:180]}" for m in preferences))
+        if open_loops: parts.append("— Открытые задачи/вопросы —\n" + "\n".join(f"• {m.text[:180]}" for m in open_loops))
+        if mem_lines: parts.append(f"— Связанные воспоминания —\n{chr(10).join(mem_lines)}")
         parts.append(f"— Новое сообщение —\nОператор: {request}\nОтвет:")
         user = "\n\n".join(parts)
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
@@ -923,9 +1049,9 @@ class CognitiveEngine:
     def think(self, request):
         rid = "req-" + uuid.uuid4().hex
         self.memory.record_message("human", request)
+        if self.state: self.state.adapt_from_text(request)
         memories = self.memory.search(request, limit=MAX_MEMORY_RESULTS)
         if not memories: memories = self.memory.important(5)
-        if self.state: self.state.adapt_from_text(request)
         self.recalculate_motivations()
         source = "local"; response = ""
         if self.llm is not None and self.llm.is_available():
@@ -941,14 +1067,18 @@ class CognitiveEngine:
 
     def think_proactive(self):
         memories = self.memory.important(5)
+        principles = self.memory.principles(3)
+        open_loops = self.memory.open_loops(5)
         patterns = self.notice_words(min_count=3)
         emotions = self.notice_emotions()
         ctx = []
+        if principles: ctx.append("Принципы:\n" + "\n".join(f"• {m.text[:150]}" for m in principles))
+        if open_loops: ctx.append("Открытые задачи:\n" + "\n".join(f"• {m.text[:150]}" for m in open_loops))
         if memories: ctx.append("Последние:\n" + "\n".join(f"• {m.text[:150]}" for m in memories[:3]))
         if patterns: ctx.append("Повторяется: " + ", ".join(f"{w} ({c})" for w, c in patterns[:3]))
         if emotions: ctx.append("Эмоции: " + ", ".join(f"{e} ({c})" for e, c in emotions[:3]))
-        prompt = ("Посмотри на мою память и скажи что-то важное. "
-                  "Одно-два предложения. Можно задать вопрос. По-русски.\n\n" + "\n".join(ctx))
+        prompt = ("Посмотри на мою память, принципы и открытые задачи и скажи, что сейчас важно. "
+                  "Одно-два предложения. Если есть незавершённое — предложи следующий безопасный шаг. По-русски.\n\n" + "\n".join(ctx))
         ans = None
         if self.llm is not None and self.llm.is_available():
             ans = self.llm.chat([{"role": "user", "content": prompt}], timeout=60.0)
@@ -967,11 +1097,15 @@ class CognitiveEngine:
     def _local(self, request, memories):
         low = request.lower()
         if any(w in low.split() for w in ("что", "как", "почему", "зачем", "где", "когда", "кто")):
+            identity = self.memory.recall_identity()
             if memories:
                 lines = [f"Помню {len(memories)} связанных:"]
-                for m in memories[:3]: lines.append(f"  • {m.text[:80]}")
+                for m in memories[:3]: lines.append(f"  • [{m.kind}] {m.text[:100]}")
+                if self.memory.open_loops(2):
+                    lines.append("Открытые задачи:")
+                    lines.extend(f"  • {m.text[:100]}" for m in self.memory.open_loops(2))
                 return "\n".join(lines)
-            return "Локальный интеллект ограничен. Подключи LLM (llm on)."
+            return identity + "\n\nЛокальный интеллект ограничен. Подключи LLM (llm on)."
         return "Запомнил."
 
 
@@ -1089,7 +1223,9 @@ class NightWorker:
         existing = self.memory.night_report_for_date(today)
         if existing: return existing["text"]
         mems = self.memory.memories_today()
-        if not mems: return "Сегодня я ничего не запомнил."
+        principles = self.memory.principles(5)
+        open_loops = self.memory.open_loops(8)
+        if not mems and not principles and not open_loops: return "Сегодня я ничего не запомнил."
         diary = [f"• {m.text[:150]}" for m in mems if m.kind in ("dialog", "general", "experience")]
         pat = self.mind.notice_words(limit=30, min_count=2)
         pat_lines = [f"• «{w}» — {c}" for w, c in pat[:5]]
@@ -1097,20 +1233,33 @@ class NightWorker:
         emo_lines = [f"• {e} — {c}" for e, c in emo[:5]]
         goals = []
         for m in mems:
-            if any(mk in m.text.lower() for mk in ("хочу", "надо", "должен", "планирую")):
+            if m.kind not in ("dialog", "general", "experience"):
+                continue
+            if any(mk in m.text.lower() for mk in ("хочу", "надо", "должен", "планирую", "нужно")):
                 goals.append(f"• {m.text[:150]}")
         parts = [f"Разбор дня {today}:", f"\nЗаписей: {len(mems)}"]
+        if principles:
+            parts.append("\nПринципы:"); parts.extend(f"• {m.text[:150]}" for m in principles)
+        if open_loops:
+            parts.append("\nОткрытые задачи:"); parts.extend(f"• {m.text[:150]}" for m in open_loops)
         if diary: parts.append("\nЧто было:"); parts.extend(diary[:10])
         if pat_lines: parts.append("\nПовторялось:"); parts.extend(pat_lines)
         if emo_lines: parts.append("\nЭмоции:"); parts.extend(emo_lines)
-        if goals: parts.append("\nНезавершённое:"); parts.extend(goals[:5])
+        if goals: parts.append("\nНезавершённое из сегодняшних записей:"); parts.extend(goals[:5])
         llm = self.mind.llm
         if llm is not None and llm.is_available():
-            prompt = ("Ты — Symbiont. Разбор дня. Что важно, что повторяется, "
-                      "на что обратить внимание завтра. 5-7 предложений.\n\n" + "\n".join(parts))
+            prompt = ("Ты — Symbiont. Разбор дня. Учитывай принципы и открытые задачи. "
+                      "Выдели важное, повторяющееся и следующий безопасный шаг. 5-7 предложений. "
+                      "Не выдавай предположение за факт.\n\n" + "\n".join(parts))
             ans = llm.chat([{"role": "user", "content": prompt}], timeout=120.0)
             if ans: parts.append("\nРазмышление:"); parts.append(ans.strip())
-        text = "\n".join(parts); self.memory.save_night_report(today, text)
+        text = "\n".join(parts)
+        self.memory.save_night_report(today, text)
+        # Night worker turns explicit unresolved intent into durable open-loop memory.
+        for goal in goals[:5]:
+            clean = goal.lstrip("• ").strip()
+            if clean and not any(clean.lower() in m.text.lower() for m in open_loops):
+                self.memory.remember(clean, kind="open_loop", importance=7, source="night_worker", tags=["night", "open_loop"])
         return text
 
 
@@ -1382,7 +1531,7 @@ class Wallet:
 class Economy:
     def __init__(self, path, journal):
         self.path = path; self.journal = journal; self.lock = threading.RLock()
-        self.wallet = Wallet(); self.last_food = None; self._load()
+        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self._load()
 
     def _load(self):
         if not self.path.exists(): return
@@ -1391,7 +1540,7 @@ class Economy:
             self.wallet = Wallet(float(w.get("balance", 0)),
                                  float(w.get("lifetime_received", 0)),
                                  float(w.get("lifetime_spent", 0)))
-            self.last_food = data.get("last_food_allocation")
+            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {})
         except Exception: pass
 
     def _save(self):
@@ -1429,6 +1578,140 @@ class Economy:
             self.last_food = today; self._save()
             self.journal.append("economy.food_allocation",
                                 {"amount": DEFAULT_FOOD_BUDGET, "date": today})
+            return True
+
+    def reserve_quest(self, quest_id, reward, creator_node="", worker_node="",
+                      creator_type="personal", worker_type="personal",
+                      currency=None, expires_at=None, proof=None):
+        quest_id = str(quest_id)
+        reward = float(reward)
+
+        if not quest_id or reward <= 0:
+            return False
+
+        with self.lock:
+            if quest_id in self.escrow:
+                return False
+
+            if reward > self.wallet.balance:
+                return False
+
+            self.wallet.balance -= reward
+
+            tx = {
+                "quest_id": quest_id,
+                "creator_node": creator_node,
+                "worker_node": worker_node,
+                "creator_type": creator_type,
+                "worker_type": worker_type,
+                "reward": reward,
+                "currency": currency or CURRENCY,
+                "status": "ESCROW",
+                "escrow_state": "ESCROW",
+                "created_at": now_iso(),
+                "expires_at": expires_at,
+                "proof": proof,
+            }
+
+            self.escrow[quest_id] = tx
+            self._save()
+            self.journal.append("economy.escrow_reserved", tx)
+
+            return True
+
+    def release_quest(self, quest_id, worker_node=""):
+        quest_id = str(quest_id)
+
+        with self.lock:
+            tx = self.escrow.get(quest_id)
+            if not tx:
+                return False
+
+            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+                return False
+
+            reward = float(tx.get("reward", 0))
+            if reward <= 0:
+                return False
+
+            tx["worker_node"] = worker_node or tx.get("worker_node", "")
+            tx["status"] = "RELEASED"
+            tx["escrow_state"] = "RELEASED"
+            tx["released_at"] = now_iso()
+
+            self.wallet.balance += reward
+            self.wallet.lifetime_received += reward
+
+            self._save()
+            self.journal.append(
+                "economy.escrow_released",
+                {
+                    "quest_id": quest_id,
+                    "reward": reward,
+                    "worker_node": tx.get("worker_node", "")
+                }
+            )
+
+            return reward
+
+    def refund_quest(self, quest_id):
+        quest_id = str(quest_id)
+
+        with self.lock:
+            tx = self.escrow.get(quest_id)
+            if not tx:
+                return False
+
+            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+                return False
+
+            reward = float(tx.get("reward", 0))
+            if reward <= 0:
+                return False
+
+            tx["status"] = "REFUNDED"
+            tx["escrow_state"] = "REFUNDED"
+            tx["refunded_at"] = now_iso()
+
+            self.wallet.balance += reward
+
+            self._save()
+            self.journal.append(
+                "economy.escrow_refunded",
+                {
+                    "quest_id": quest_id,
+                    "reward": reward,
+                    "creator_node": tx.get("creator_node", "")
+                }
+            )
+
+            return reward
+
+    def freeze_quest(self, quest_id, reason=""):
+        quest_id = str(quest_id)
+
+        with self.lock:
+            tx = self.escrow.get(quest_id)
+            if not tx:
+                return False
+
+            if tx.get("escrow_state") != "ESCROW":
+                return False
+
+            tx["status"] = "FROZEN"
+            tx["escrow_state"] = "FROZEN"
+            tx["freeze_reason"] = reason
+            tx["frozen_at"] = now_iso()
+
+            self._save()
+            self.journal.append(
+                "economy.escrow_frozen",
+                {
+                    "quest_id": quest_id,
+                    "reason": reason
+                }
+            )
+
             return True
 
     def settle_quest_reward(self, quest_id, reward, from_node="network"):
