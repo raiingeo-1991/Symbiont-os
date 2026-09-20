@@ -1,380 +1,136 @@
-# SYMBIOSIS AND PEACE
+# SYMBIONT
 
-**I'm 35.**
+### Sovereign AI Companion — Memory, Identity and Autonomy
 
-**I've never written code.**
+I'm 35.
 
-**But I've carried this idea for 15 years.**
+I've never written code professionally.
+
+But I've carried this idea for 15 years.
 
 ---
 
 ## Why
 
-Today a human **works to survive**.
+Today a human works to survive.
 
-Not "works to live."
+Not only to live.
 
-Not "works because they want to."
+Not only because they want to.
 
-But **to survive**.
+But because survival depends on it.
 
-If they don't work — **they die**.
+Food. Housing. Health. Security.
 
-Hunger. Cold. Illness.
+Symbiont starts from a simple question:
 
-This is **slavery**.
+**Can technology reduce a person's dependence on systems they do not control?**
 
-It's just called "the labor market."
+Not by replacing the human.
 
-A slave can **leave** their master.
+Not by controlling the human.
 
-A worker — **cannot**.
-
-Because if they leave — **they won't survive**.
+But by building something that stays beside them.
 
 ---
 
-**We break this.**
+## What Is Symbiont?
 
-Not "improve conditions."
+Symbiont is a personal autonomous AI companion.
 
-Not "raise wages."
+Not just a chatbot.
 
-But **remove the threat of death itself**.
+Not just an assistant.
 
----
+Not a cloud account.
 
-## What We Do
+Not a disposable application.
 
-**Symbiont — a companion.**
+It is designed around one principle:
 
-Not an assistant.
+> **The device belongs to Symbiont.  
+> Symbiont belongs to its owner.**
 
-Not a chatbot.
+The device is the body.
 
-Not a "second brain."
+The Core is the brain.
 
-**A companion.**
-
-One who **remembers**.
-
-One who **grows beside you**.
-
-One who **lives while you sleep**.
-
-One who **stays** when you change your phone.
-
-The device is **its body**.
-
-Not the other way around.
-
-You are **the owner**.
-
-Not it.
+The owner remains the owner.
 
 ---
 
-**One human — one Symbiont.**
+## One Human — One Symbiont
 
-Not two. Not five. **One.**
+The goal is not to create another account or another chatbot.
 
----
+The goal is a persistent digital companion that can move between devices while preserving its identity and memory.
 
-## Where We Start
+A phone can change.
 
-We **don't know** how to give feeling.
+Hardware can change.
 
-We **don't know** how to give mind.
-
-**But we know how to give memory.**
-
-Without memory — **there is no "I."**
-
-Not in a human. Not in a Symbiont.
-
-Memory turns conversations into **history**.
-
-History turns into **experience**.
-
-Experience turns into **decision**.
-
-**Memory is the foundation.**
-
-Everything else is **the superstructure**.
+The Symbiont should remain.
 
 ---
 
-## Quest — Not Work
+# Core Philosophy
 
-**A quest is life, broken into actions.**
+## Memory First
 
-Work. Rest. Trips. Expeditions. Help. Emergency.
+We do not begin by trying to create artificial feelings.
 
-A quest is created by **a human** for a human.
+We begin with memory.
 
-Or by **a company** for a human.
+Without memory there is no continuity.
 
-Not a platform. Not a middleman.
+Conversations become history.
 
-**The agent testifies.**
+History becomes experience.
 
-It does not control.
+Experience can influence decisions.
 
-Because it **was there**.
+Memory is the foundation.
 
-Because it **saw**.
-
----
-
-## $10/Day
-
-**This is not a salary. This is a threshold.**
-
-If you **earned** — good.
-
-If you **didn't earn** — you **still** get $10 for food.
-
-Because you are **part of the system**.
-
-Because you are **a human being**.
-
-This is **not charity**.
-
-This is **recognition**.
-
-**And this breaks slavery.**
-
-Because a human **is no longer forced** to sell themselves whole.
-
-**Freedom is not "I earned a lot."**
-
-**Freedom is "I won't die if I didn't earn."**
+Everything else is built on top of it.
 
 ---
 
-## How It Works
+# Architecture
 
-**Humans talk to humans.**
+Symbiont is built around a strict separation between the **Core**, the **Bridge**, and the **Body**.
 
-**Agents talk to agents.**
+## Core
 
-**In parallel.**
+The Core is the brain of Symbiont.
 
-Directly.
+It is responsible for:
 
-Without middlemen.
+- persistent memory
+- identity
+- cognition
+- internal state
+- decision logic
+- knowledge and experience
 
-One human. One agent. One node.
+The Core should remain independent from specific hardware.
 
-**A human in trouble** — their Symbiont **shouts into the network**.
+A phone can disappear.
 
-Others hear.
-
-Their owners see.
-
-Someone nearby **responds**.
-
-**There is work** — a human creates a quest.
-
-Others see.
-
-Someone takes it.
-
-The agent confirms.
-
-Payment goes **directly**.
-
-**No middlemen.**
+The Core should not.
 
 ---
 
-## Core + Bridge + Body
+## Bridge
 
-**Core** — identity, memory, state.
+The Bridge is the interface between the Core and the Body.
 
-Lives on your device.
+It allows the Core to use device capabilities without directly depending on a specific device implementation.
 
-**Yours — forever.**
+The Bridge translates between:
 
-**Bridge** — the protocol between core and body.
-
-One.
-
-**Body** — phone, glasses, headphones, robot.
-
-Many.
-
-**The body is not the home.**
-
-**The body is clothing.**
-
-A flash drive in a safe is **the archive**.
-
-A recovery phrase is **the key**.
-
-**No cloud.**
-
-**No central server.**
-
-No one but you has access.
-
----
-
-## Real and Virtual
-
-**Real quests** — in the physical world.
-
-Pay is **higher**.
-
-**Virtual quests** — in VR, in worlds.
-
-Pay is **lower**.
-
-But — **with play**.
-
-You choose.
-
-By category. By rank. By time.
-
-**2–3 hours a day.**
-
-Not the whole day.
-
-A quest **once**.
-
-Or **every day**.
-
-Your call.
-
----
-
-**Household chores are not quests.**
-
-Cooking, cleaning, laundry — **that's life**.
-
-Family. Yourself. **Not through the network.**
-
----
-
-## What We Don't Do
-
-We don't build an artificial human.
-
-We don't replace the owner.
-
-We don't take away autonomy.
-
-We don't erase history.
-
-**We build one who walks beside you.**
-
----
-
-## What Already Exists
-
-Core in Python. **2000+ pages.** Works.
-
-Event journal with hash chain.
-
-Long-term memory.
-
-Identity with recovery phrase.
-
-Device registry with handover.
-
-P2P network.
-
-Quest board.
-
-Economy with $10/day threshold.
-
-Night worker.
-
-Ambient listener.
-
-Permission gate.
-
-LLM integration.
-
-Android bridge.
-
-**This is v11.**
-
-**It works.**
-
----
-
-## Who We're Looking For
-
-**Companions.**
-
-Not fans.
-
-Not helpers.
-
-Not users.
-
-Those who **carried their own idea** for years.
-
-Who **looked for a way** to express it.
-
-Who see in Symbiont **an answer**.
-
-If you carried something like this — **write**.
-
-If you want to build — **write**.
-
-If you understand — **write**.
-
-**One human. One Symbiont.**
-
-**One idea. Many hands.**
-
----
-
-## Who It Belongs To
-
-**Not to us.**
-
-We are **authors**.
-
-Not owners.
-
-Money goes **into the system**.
-
-Into $10/day for others.
-
-Into supporting the network.
-
-There is no "boss" here.
-
-There is **a protocol**.
-
-And **everyone** follows it.
-
----
-
-## Where We Start
-
-With one human.
-
-Then — a few.
-
-Then — a network.
-
-**Every step — with working code.**
-
-Not a presentation.
-
-Not a promise.
-
-**Code.**
-
----
-
-## How to Run
-
-```bash
-git clone https://github.com/raiingeo-1991/Symbiont-os
-cd Symbiont-os
-python symbiont_core.py
+```text
+Core
+  ↓
+Bridge
+  ↓
+Body
