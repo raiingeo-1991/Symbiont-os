@@ -1,0 +1,941 @@
+import hashlib
+import json
+import os
+import threading
+import time
+import uuid
+
+
+class GuardianError(Exception):
+    """Base Guardian error."""
+
+
+class GuardianExtension:
+    """
+    Extension interface for forks.
+
+    Extensions receive controlled Guardian events.
+    They do not receive Core, Memory, Wallet, or Settlement access.
+    """
+
+    name = "extension"
+
+    def observe(self, event):
+        return None
+
+    def detect(self, event):
+        return None
+
+    def assess(self, evidence):
+        return None
+
+    def attest(self, evidence):
+        return None
+
+
+class GuardianNode:
+    """
+    Guardian Node — specialized Symbiont security node.
+
+    Responsibilities:
+        VERIFY
+        OBSERVE
+        DETECT
+        ASSESS
+        RESTRICT
+        QUARANTINE
+        ATTEST
+        AUDIT
+
+    Security boundary:
+        Guardian MUST NOT:
+            - modify Symbiont Core
+            - modify another node's memory
+            - modify node identity
+            - access wallets
+            - release/refund/reserve funds
+            - execute settlement
+            - grant itself capabilities
+    """
+
+    VERSION = "GUARDIAN/1"
+
+    ACTIVE = "ACTIVE"
+    SUSPICIOUS = "SUSPICIOUS"
+    RESTRICTED = "RESTRICTED"
+    QUARANTINED = "QUARANTINED"
+
+    RISK_NORMAL = "NORMAL"
+    RISK_LOW = "LOW"
+    RISK_MEDIUM = "MEDIUM"
+    RISK_HIGH = "HIGH"
+    RISK_CRITICAL = "CRITICAL"
+
+    VALID_STATES = {
+        ACTIVE,
+        SUSPICIOUS,
+        RESTRICTED,
+        QUARANTINED,
+    }
+
+    VALID_RISKS = {
+        RISK_NORMAL,
+        RISK_LOW,
+        RISK_MEDIUM,
+        RISK_HIGH,
+        RISK_CRITICAL,
+    }
+
+    def __init__(self, node_identity, audit_path=None):
+        if node_identity is None:
+            raise GuardianError("node_identity is required")
+
+        if not hasattr(node_identity, "node_id"):
+            raise GuardianError("invalid node identity")
+
+        self.identity = node_identity
+        self.node_id = str(node_identity.node_id)
+
+        self.audit_path = audit_path or os.path.join(
+            "symbiont_data",
+            "guardian_audit.jsonl",
+        )
+
+        self._lock = threading.RLock()
+
+        self._peers = {}
+        self._observations = {}
+        self._incidents = {}
+        self._attestations = {}
+        self._extensions = {}
+
+        self._sequence = 0
+        self._audit_previous_hash = None
+
+        self._ensure_storage()
+        self._load_audit_state()
+
+    # =========================================================
+    # INTERNAL STORAGE
+    # =========================================================
+
+    def _ensure_storage(self):
+        directory = os.path.dirname(self.audit_path)
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True,
+            )
+
+    def _load_audit_state(self):
+        """
+        Recover the last audit hash and sequence.
+
+        This does not trust the file blindly.
+        The chain can later be verified with verify_audit_chain().
+        """
+
+        try:
+            with open(
+                self.audit_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                lines = [
+                    line.strip()
+                    for line in f
+                    if line.strip()
+                ]
+
+            if not lines:
+                return
+
+            last = json.loads(lines[-1])
+
+            self._sequence = int(
+                last.get(
+                    "sequence",
+                    0,
+                )
+            )
+
+            self._audit_previous_hash = last.get(
+                "event_hash"
+            )
+
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
+            self._sequence = 0
+            self._audit_previous_hash = None
+
+    @staticmethod
+    def _canonical(data):
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    @classmethod
+    def _digest(cls, data):
+        return hashlib.sha256(
+            cls._canonical(data)
+        ).hexdigest()
+
+    # =========================================================
+    # AUDIT CHAIN
+    # =========================================================
+
+    def _audit(self, event, data=None):
+        data = data or {}
+
+        with self._lock:
+            self._sequence += 1
+
+            record = {
+                "guardian": self.node_id,
+                "sequence": self._sequence,
+                "timestamp": time.time(),
+                "event": str(event),
+                "data": data,
+                "previous_hash": (
+                    self._audit_previous_hash
+                ),
+            }
+
+            record["event_hash"] = self._digest(
+                record
+            )
+
+            with open(
+                self.audit_path,
+                "a",
+                encoding="utf-8",
+            ) as f:
+                f.write(
+                    json.dumps(
+                        record,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+
+            self._audit_previous_hash = (
+                record["event_hash"]
+            )
+
+            return dict(record)
+
+    def verify_audit_chain(self):
+        """
+        Verify the local tamper-evident audit chain.
+        """
+
+        try:
+            with open(
+                self.audit_path,
+                "r",
+                encoding="utf-8",
+            ) as f:
+                lines = [
+                    line.strip()
+                    for line in f
+                    if line.strip()
+                ]
+        except OSError:
+            return True
+
+        previous_hash = None
+        expected_sequence = 1
+
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                return False
+
+            if record.get("sequence") != expected_sequence:
+                return False
+
+            if record.get("previous_hash") != previous_hash:
+                return False
+
+            stored_hash = record.get(
+                "event_hash"
+            )
+
+            if not stored_hash:
+                return False
+
+            unsigned = dict(record)
+            del unsigned["event_hash"]
+
+            calculated = self._digest(
+                unsigned
+            )
+
+            if calculated != stored_hash:
+                return False
+
+            previous_hash = stored_hash
+            expected_sequence += 1
+
+        return True
+
+    # =========================================================
+    # EXTENSIONS
+    # =========================================================
+
+    def register_extension(self, extension):
+        """
+        Register an extension for fork/custom functionality.
+
+        Extensions receive Guardian events only.
+        """
+
+        if extension is None:
+            return False
+
+        name = getattr(
+            extension,
+            "name",
+            None,
+        )
+
+        if not name:
+            return False
+
+        name = str(name).strip()
+
+        if not name:
+            return False
+
+        with self._lock:
+            self._extensions[name] = extension
+
+        self._audit(
+            "extension.registered",
+            {
+                "name": name,
+            },
+        )
+
+        return True
+
+    def remove_extension(self, name):
+        name = str(name).strip()
+
+        with self._lock:
+            if name not in self._extensions:
+                return False
+
+            del self._extensions[name]
+
+        self._audit(
+            "extension.removed",
+            {
+                "name": name,
+            },
+        )
+
+        return True
+
+    def extensions(self):
+        with self._lock:
+            return list(
+                self._extensions.keys()
+            )
+
+    # =========================================================
+    # PEERS
+    # =========================================================
+
+    def register_peer(
+        self,
+        node_id,
+        public_key=None,
+        metadata=None,
+    ):
+        node_id = str(node_id).strip()
+
+        if not node_id:
+            return False
+
+        if node_id == self.node_id:
+            return False
+
+        with self._lock:
+            peer = self._peers.get(
+                node_id,
+                {},
+            )
+
+            peer.update(
+                {
+                    "node_id": node_id,
+                    "state": peer.get(
+                        "state",
+                        self.ACTIVE,
+                    ),
+                    "risk": peer.get(
+                        "risk",
+                        self.RISK_NORMAL,
+                    ),
+                    "registered_at": peer.get(
+                        "registered_at",
+                        time.time(),
+                    ),
+                    "last_seen": time.time(),
+                }
+            )
+
+            if public_key is not None:
+                peer["public_key"] = str(
+                    public_key
+                )
+
+            if metadata is not None:
+                peer["metadata"] = metadata
+
+            self._peers[node_id] = peer
+
+        self._audit(
+            "peer.registered",
+            {
+                "node_id": node_id,
+            },
+        )
+
+        return True
+
+    def get_peer(self, node_id):
+        node_id = str(node_id).strip()
+
+        with self._lock:
+            peer = self._peers.get(node_id)
+
+            if peer is None:
+                return None
+
+            return dict(peer)
+
+    # =========================================================
+    # VERIFY
+    # =========================================================
+
+    def verify(
+        self,
+        node_id,
+        checks=None,
+    ):
+        """
+        Verify a node using results supplied by the
+        existing security layers.
+
+        Guardian does not replace SCP-1 or Zero Trust.
+        It aggregates their results.
+        """
+
+        node_id = str(node_id).strip()
+
+        if not node_id:
+            return False
+
+        checks = checks or {}
+
+        required = {
+            "identity",
+            "signature",
+            "replay",
+            "trust",
+            "policy",
+        }
+
+        passed = all(
+            checks.get(name) is True
+            for name in required
+        )
+
+        self.register_peer(node_id)
+
+        with self._lock:
+            peer = self._peers[node_id]
+
+            peer["last_seen"] = time.time()
+
+            if passed:
+                peer["state"] = self.ACTIVE
+                peer["risk"] = self.RISK_NORMAL
+            else:
+                peer["state"] = self.SUSPICIOUS
+                peer["risk"] = self.RISK_HIGH
+
+        result = {
+            "node_id": node_id,
+            "passed": passed,
+            "checks": dict(checks),
+        }
+
+        self._audit(
+            "peer.verified",
+            result,
+        )
+
+        self._dispatch_extensions(
+            "observe",
+            {
+                "type": "verification",
+                **result,
+            },
+        )
+
+        return passed
+
+    # =========================================================
+    # OBSERVE
+    # =========================================================
+
+    def observe(
+        self,
+        node_id,
+        event,
+        data=None,
+    ):
+        node_id = str(node_id).strip()
+        event = str(event).strip()
+
+        if not node_id or not event:
+            return False
+
+        record = {
+            "id": "OBS-" + uuid.uuid4().hex,
+            "node_id": node_id,
+            "event": event,
+            "data": data or {},
+            "timestamp": time.time(),
+        }
+
+        with self._lock:
+            self._observations.setdefault(
+                node_id,
+                [],
+            ).append(record)
+
+            peer = self._peers.get(node_id)
+
+            if peer:
+                peer["last_seen"] = time.time()
+
+        self._audit(
+            "peer.observed",
+            record,
+        )
+
+        self._dispatch_extensions(
+            "observe",
+            record,
+        )
+
+        return True
+
+    # =========================================================
+    # DETECT
+    # =========================================================
+
+    def detect(
+        self,
+        node_id,
+        signal,
+        severity="warning",
+        data=None,
+    ):
+        node_id = str(node_id).strip()
+        signal = str(signal).strip()
+        severity = str(
+            severity
+        ).lower().strip()
+
+        if not node_id or not signal:
+            return False
+
+        severity_to_risk = {
+            "info": self.RISK_LOW,
+            "warning": self.RISK_MEDIUM,
+            "medium": self.RISK_MEDIUM,
+            "high": self.RISK_HIGH,
+            "critical": self.RISK_CRITICAL,
+        }
+
+        risk = severity_to_risk.get(
+            severity,
+            self.RISK_MEDIUM,
+        )
+
+        incident = {
+            "id": "INC-" + uuid.uuid4().hex,
+            "node_id": node_id,
+            "signal": signal,
+            "severity": severity,
+            "risk": risk,
+            "data": data or {},
+            "timestamp": time.time(),
+        }
+
+        with self._lock:
+            self._incidents[
+                incident["id"]
+            ] = incident
+
+            peer = self._peers.setdefault(
+                node_id,
+                {
+                    "node_id": node_id,
+                    "registered_at": time.time(),
+                },
+            )
+
+            peer["last_seen"] = time.time()
+
+            if risk in {
+                self.RISK_HIGH,
+                self.RISK_CRITICAL,
+            }:
+                peer["state"] = self.SUSPICIOUS
+
+            peer["risk"] = risk
+
+        self._audit(
+            "security.detected",
+            incident,
+        )
+
+        self._dispatch_extensions(
+            "detect",
+            incident,
+        )
+
+        return dict(incident)
+
+    # =========================================================
+    # RESTRICT / QUARANTINE
+    # =========================================================
+
+    def restrict(
+        self,
+        node_id,
+        reason,
+        quarantine=False,
+    ):
+        node_id = str(node_id).strip()
+        reason = str(reason).strip()
+
+        if not node_id or not reason:
+            return False
+
+        state = (
+            self.QUARANTINED
+            if quarantine
+            else self.RESTRICTED
+        )
+
+        self.register_peer(node_id)
+
+        with self._lock:
+            peer = self._peers[node_id]
+
+            peer["state"] = state
+            peer["restricted_at"] = time.time()
+            peer["restriction_reason"] = reason
+
+        self._audit(
+            "peer.restricted",
+            {
+                "node_id": node_id,
+                "state": state,
+                "reason": reason,
+            },
+        )
+
+        return True
+
+    def restore(
+        self,
+        node_id,
+        reason="manual restoration",
+    ):
+        node_id = str(node_id).strip()
+
+        with self._lock:
+            peer = self._peers.get(node_id)
+
+            if peer is None:
+                return False
+
+            peer["state"] = self.ACTIVE
+            peer["risk"] = self.RISK_NORMAL
+            peer["restored_at"] = time.time()
+            peer["restoration_reason"] = str(
+                reason
+            )
+
+        self._audit(
+            "peer.restored",
+            {
+                "node_id": node_id,
+                "reason": reason,
+            },
+        )
+
+        return True
+
+    # =========================================================
+    # ATTESTATION
+    # =========================================================
+
+    def attest(
+        self,
+        event,
+        data=None,
+    ):
+        event = str(event).strip()
+
+        if not event:
+            return None
+
+        with self._lock:
+            self._sequence += 1
+
+            record = {
+                "attestation_id": (
+                    "ATT-" + uuid.uuid4().hex
+                ),
+                "guardian": self.node_id,
+                "sequence": self._sequence,
+                "timestamp": time.time(),
+                "event": event,
+                "data": data or {},
+            }
+
+            record["digest"] = self._digest(
+                record
+            )
+
+            self._attestations[
+                record["attestation_id"]
+            ] = record
+
+        self._audit(
+            "attestation.created",
+            record,
+        )
+
+        return dict(record)
+
+    # =========================================================
+    # QUEST SECURITY
+    # =========================================================
+
+    def validate_quest_event(
+        self,
+        quest_id,
+        worker_node,
+        event,
+        proof=None,
+    ):
+        """
+        Security hook for Quest.
+
+        Guardian validates evidence presence and records
+        the security result.
+
+        It NEVER performs Settlement.
+        """
+
+        quest_id = str(quest_id).strip()
+        worker_node = str(worker_node).strip()
+        event = str(event).strip()
+
+        if not quest_id:
+            return False
+
+        if not worker_node:
+            return False
+
+        if not event:
+            return False
+
+        proof_present = proof is not None
+
+        result = {
+            "quest_id": quest_id,
+            "worker_node": worker_node,
+            "event": event,
+            "proof_present": proof_present,
+            "guardian": self.node_id,
+            "timestamp": time.time(),
+            "valid": proof_present,
+        }
+
+        self._audit(
+            "quest.validated",
+            result,
+        )
+
+        self._dispatch_extensions(
+            "observe",
+            {
+                "type": "quest_validation",
+                **result,
+            },
+        )
+
+        return result
+
+    # =========================================================
+    # SELF INTEGRITY
+    # =========================================================
+
+    def self_integrity(self):
+        """
+        Verify the Guardian audit chain.
+
+        This is deliberately local and does not grant
+        Guardian control over any other subsystem.
+        """
+
+        audit_ok = self.verify_audit_chain()
+
+        result = {
+            "guardian": self.node_id,
+            "audit_chain": audit_ok,
+            "identity_present": bool(
+                self.node_id
+            ),
+            "protocol": self.VERSION,
+        }
+
+        result["healthy"] = all(
+            result.values()
+        )
+
+        return result
+
+    # =========================================================
+    # EXTENSION DISPATCH
+    # =========================================================
+
+    def _dispatch_extensions(
+        self,
+        method,
+        event,
+    ):
+        with self._lock:
+            extensions = list(
+                self._extensions.values()
+            )
+
+        for extension in extensions:
+            handler = getattr(
+                extension,
+                method,
+                None,
+            )
+
+            if not callable(handler):
+                continue
+
+            try:
+                handler(dict(event))
+            except Exception as exc:
+                self._audit(
+                    "extension.error",
+                    {
+                        "extension": getattr(
+                            extension,
+                            "name",
+                            "unknown",
+                        ),
+                        "method": method,
+                        "error": str(exc),
+                    },
+                )
+
+    # =========================================================
+    # STATUS
+    # =========================================================
+
+    def status(self):
+        with self._lock:
+            states = {
+                state: 0
+                for state in self.VALID_STATES
+            }
+
+            risks = {
+                risk: 0
+                for risk in self.VALID_RISKS
+            }
+
+            for peer in self._peers.values():
+                state = peer.get(
+                    "state",
+                    self.SUSPICIOUS,
+                )
+
+                risk = peer.get(
+                    "risk",
+                    self.RISK_NORMAL,
+                )
+
+                if state in states:
+                    states[state] += 1
+
+                if risk in risks:
+                    risks[risk] += 1
+
+            return {
+                "protocol": self.VERSION,
+                "guardian_node": self.node_id,
+                "peers": len(self._peers),
+                "incidents": len(
+                    self._incidents
+                ),
+                "observations": sum(
+                    len(items)
+                    for items in self._observations.values()
+                ),
+                "attestations": len(
+                    self._attestations
+                ),
+                "extensions": list(
+                    self._extensions.keys()
+                ),
+                "sequence": self._sequence,
+                "states": states,
+                "risks": risks,
+                "self_integrity": self.self_integrity(),
+                "capabilities": {
+                    "core_write": False,
+                    "memory_write": False,
+                    "wallet_access": False,
+                    "settlement": False,
+                    "identity_write": False,
+                },
+            }
+
+
+def get_guardian_node(
+    node_identity,
+    audit_path=None,
+):
+    return GuardianNode(
+        node_identity,
+        audit_path=audit_path,
+    )
