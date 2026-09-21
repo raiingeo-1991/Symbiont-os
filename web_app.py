@@ -36,7 +36,7 @@ class App(BaseHTTPRequestHandler):
         if urlparse(self.path).path == '/api/memories':
             try:
                 records = get_arseniy().memory.all_memories(limit=100)
-                self.send_json({'memories': [{'text': r['text'], 'kind': r['kind'], 'importance': r['importance']} for r in records]})
+                self.send_json({'memories': [{'text': r.text, 'kind': r.kind, 'importance': r.importance} for r in records]})
             except Exception as error:
                 self.send_json({'error': str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
@@ -65,4 +65,5 @@ class App(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     print('Арсений открыт: http://127.0.0.1:8765')
     ThreadingHTTPServer(('127.0.0.1',8765),App).serve_forever()
+
 
