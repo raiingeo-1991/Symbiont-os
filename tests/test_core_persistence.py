@@ -102,5 +102,27 @@ class NightWorkerTests(unittest.TestCase):
             finally:
                 sym.close()
 
+class CognitiveContextTests(unittest.TestCase):
+    def test_llm_context_includes_priority_memory_types(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with contextlib.redirect_stdout(io.StringIO()):
+                sym = Symbiont(root)
+            try:
+                sym.remember("Беречь данные владельца", kind="principle", importance=8)
+                sym.remember("Отвечай кратко по-русски", kind="preference", importance=7)
+                sym.remember("Завершить резервное копирование", kind="open_loop", importance=7)
+
+                messages = sym.mind._llm_messages("Что сейчас важно?", [])
+                system = messages[0]["content"]
+                context = messages[1]["content"]
+                self.assertIn("Текущее когнитивное состояние", system)
+                self.assertIn("Принципы Symbiont", context)
+                self.assertIn("Предпочтения владельца", context)
+                self.assertIn("Открытые задачи/вопросы", context)
+                self.assertIn("Завершить резервное копирование", context)
+            finally:
+                sym.close()
+
 if __name__ == "__main__":
     unittest.main()
