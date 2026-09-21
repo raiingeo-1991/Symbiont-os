@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from symbiont_core import EventJournal, Identity, Symbiont, canonical_json
+from symbiont_core import EventJournal, Identity, MemoryVault, Symbiont, canonical_json
 
 
 class IdentityTests(unittest.TestCase):
@@ -67,6 +67,22 @@ class PersistenceTests(unittest.TestCase):
             self.assertFalse(valid)
             self.assertEqual(checked, 0)
 
+
+class MemorySearchTests(unittest.TestCase):
+    def test_search_prioritizes_principles_and_groups_by_kind(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            memory = MemoryVault(root / "memory.sqlite", EventJournal(root / "events.log"))
+            try:
+                general_id = memory.remember("Спокойно вести проект", kind="general", importance=10)
+                principle_id = memory.remember("Принцип: спокойно вести проект", kind="principle", importance=5)
+                matches = memory.search("спокойно проект")
+                self.assertEqual(matches[0].memory_id, principle_id)
+                self.assertIn(general_id, [item.memory_id for item in matches])
+                grouped = memory.by_kind(["general", "principle"])
+                self.assertEqual(grouped["principle"][0].memory_id, principle_id)
+            finally:
+                memory.close()
 
 if __name__ == "__main__":
     unittest.main()
