@@ -83,5 +83,24 @@ class MemorySearchTests(unittest.TestCase):
             finally:
                 memory.close()
 
+class NightWorkerTests(unittest.TestCase):
+    def test_night_worker_persists_an_open_loop_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with contextlib.redirect_stdout(io.StringIO()):
+                sym = Symbiont(root)
+            try:
+                task = "Надо завершить настройку резервной копии"
+                sym.remember(task, kind="general", importance=6)
+                report = sym.night_worker.run()
+                loops = sym.memory.open_loops()
+                self.assertIn("Незавершённое", report)
+                self.assertEqual(sum(task in item.text for item in loops), 1)
+
+                self.assertEqual(sym.night_worker.run(), report)
+                self.assertEqual(sum(task in item.text for item in sym.memory.open_loops()), 1)
+            finally:
+                sym.close()
+
 if __name__ == "__main__":
     unittest.main()
