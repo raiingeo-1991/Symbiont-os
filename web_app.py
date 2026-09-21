@@ -36,9 +36,9 @@ class App(BaseHTTPRequestHandler):
         if urlparse(self.path).path == '/api/memories':
             try:
                 records = bot().memory.all_memories(limit=100)
-                self.send_json({'memories': [{'text': r.text, 'kind': r.kind, 'importance': r.importance} for r in records]})
+                self.output({'memories': [{'text': r.text, 'kind': r.kind, 'importance': r.importance} for r in records]})
             except Exception as error:
-                self.send_json({'error': str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
+                self.output({'error': str(error)}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
         if urlparse(self.path).path == '/memory':
             raw = MEMORY_PAGE.encode('utf-8'); self.send_response(HTTPStatus.OK)
@@ -65,6 +65,7 @@ class App(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     print('Арсений открыт: http://127.0.0.1:8765')
     ThreadingHTTPServer(('127.0.0.1',8765),App).serve_forever()
+
 
 
 
