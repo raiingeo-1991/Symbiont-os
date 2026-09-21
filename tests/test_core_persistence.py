@@ -79,8 +79,7 @@ class MemorySearchTests(unittest.TestCase):
                 matches = memory.search("спокойно проект")
                 self.assertEqual(matches[0].memory_id, principle_id)
                 self.assertIn(general_id, [item.memory_id for item in matches])
-                grouped = memory.by_kind(["general", "principle"])
-                self.assertEqual(grouped["principle"][0].memory_id, principle_id)
+                self.assertEqual(memory.principles()[0].memory_id, principle_id)
             finally:
                 memory.close()
 

@@ -632,7 +632,7 @@ class MemoryVault:
     def _ranking_boost(self, row, exact_query=""):
         kind = str(row["kind"] or "").lower()
         boost = 0.0
-        if kind == "principle": boost += 4.0
+        if kind == "principle": boost += 8.0
         elif kind == "preference": boost += 2.5
         elif kind == "open_loop": boost += 3.0
         if exact_query and exact_query.lower() in str(row["text"]).lower():
