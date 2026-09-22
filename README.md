@@ -122,3 +122,13 @@ But the foundation comes first.
 > **The device belongs to the Symbiont.**
 >
 > **The Symbiont belongs to its owner.**
+
+---
+
+## Credits
+
+Some ideas and architectural approaches used in the Memory V2
+layer were inspired by the work of Artemy Voikhansky (@artemyvo).
+
+Special thanks for the discussion and permission to adapt these ideas
+for the Symbiont project.
