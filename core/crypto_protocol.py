@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import tempfile
+import shutil
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -11,11 +13,23 @@ from pathlib import Path
 
 SCP_VERSION = "SCP-1"
 DEFAULT_MAX_AGE = 300
+MAX_FUTURE_SKEW = 30
 
 
 class SCPError(Exception):
     pass
 
+
+
+def _openssl_binary():
+    configured = os.environ.get("SYMBIONT_OPENSSL_BIN", "")
+    candidates = [configured, shutil.which("openssl"),
+                  r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+                  r"C:\Program Files\OpenSSL-Win32\bin\openssl.exe"]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    raise SCPError("OpenSSL is required for SCP-1 Ed25519 signatures")
 
 class SCP1:
     """
@@ -92,7 +106,7 @@ class SCP1:
 
             result = subprocess.run(
                 [
-                    "openssl",
+                    _openssl_binary(),
                     "pkeyutl",
                     "-sign",
                     "-inkey",
@@ -125,7 +139,7 @@ class SCP1:
 
             result = subprocess.run(
                 [
-                    "openssl",
+                    _openssl_binary(),
                     "pkeyutl",
                     "-verify",
                     "-pubin",
@@ -185,7 +199,9 @@ class SCP1:
         try:
             timestamp = int(packet["timestamp"])
             now = int(time.time())
-            return abs(now - timestamp) <= int(max_age)
+            if timestamp > now + MAX_FUTURE_SKEW:
+                return False
+            return now - timestamp <= int(max_age)
         except Exception:
             return False
 

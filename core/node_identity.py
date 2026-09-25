@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import subprocess
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -23,9 +24,20 @@ class NodeIdentity:
 
         self._load_or_create()
 
+    @staticmethod
+    def _openssl_binary():
+        configured = os.environ.get("SYMBIONT_OPENSSL_BIN", "")
+        candidates = [configured, shutil.which("openssl"),
+                      r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+                      r"C:\Program Files\OpenSSL-Win32\bin\openssl.exe"]
+        for candidate in candidates:
+            if candidate and Path(candidate).is_file():
+                return str(candidate)
+        raise FileNotFoundError("OpenSSL is required for Ed25519 identities. Set SYMBIONT_OPENSSL_BIN to openssl.exe.")
+
     def _openssl(self, *args, input_data=None):
         return subprocess.run(
-            ["openssl", *args],
+            [self._openssl_binary(), *args],
             input=input_data,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -154,7 +166,7 @@ class NodeIdentity:
 
                 result = subprocess.run(
                     [
-                        "openssl",
+                        self._openssl_binary(),
                         "pkeyutl",
                         "-verify",
                         "-pubin",
@@ -172,6 +184,27 @@ class NodeIdentity:
 
                 return result.returncode == 0
 
+        except Exception:
+            return False
+
+    @staticmethod
+    def verify_with_public_key(payload, signature, public_key_b64):
+        """Verify an Ed25519 signature against a packet-supplied public key."""
+        if not isinstance(payload, bytes):
+            payload = str(payload).encode("utf-8")
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                pub_path = Path(tmp) / "pub.pem"
+                data_path = Path(tmp) / "data"
+                sig_path = Path(tmp) / "sig"
+                pub_path.write_bytes(base64.b64decode(public_key_b64, validate=True))
+                data_path.write_bytes(payload)
+                sig_path.write_bytes(base64.b64decode(signature, validate=True))
+                result = subprocess.run(
+                    [NodeIdentity._openssl_binary(), "pkeyutl", "-verify", "-pubin", "-inkey", str(pub_path),
+                     "-rawin", "-in", str(data_path), "-sigfile", str(sig_path)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                return result.returncode == 0
         except Exception:
             return False
 
