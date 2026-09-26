@@ -1,0 +1,49 @@
+# Symbiont — личные данные. НИКОГДА не коммитить.
+symbiont_data/
+data/
+*.sqlite3
+*.log
+*.jsonl
+*.key
+sync_export.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Pydroid
+.pydroid/
+
+# Система
+.DS_Store
+Thumbs.db
+
+# Local development backups / checkpoints
+*.before-*
+*.bak_*
+*.bak
+*_patched.py
+CHECKPOINT_*
+symbiont_inventory.txt
+test_registry_tmp.py
+escrow_patch.py
+
+# Historical variant source files
+core/*.before-*
+core/*.bak*
+core/*.smsa-v1.py
+core/*.xlink-complete.py
+core/*.packet-id.py
+core/*.scp1-replay.py
+core/*.scp1-v1.py
+core/*.scp1-v1-final.py
+core/*.ed25519.py
+core/*.pre-regression-test.py
+core/*.zerotrust-pre-scp1.py
+
+# Historical Core variants
+symbiont_core.escrow-*.py
+core/scp1_zerotrust.v1-final.py
