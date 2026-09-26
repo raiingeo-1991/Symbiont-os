@@ -250,9 +250,17 @@ Do not treat archived or legacy copies as the active development line.
 
 ---
 
+## Credits
+
+Some ideas and architectural approaches used in the Memory V2 layer
+were inspired by the work of Artemy Voikhansky (@artemyvo).
+
+Special thanks for the discussion and permission to adapt these ideas
+for the Symbiont project.
+
 ## License
 
-See the repository license and accompanying project documentation for the current licensing status.
+See [`LICENSE`](LICENSE) for the current licensing terms.
 
 ---
 
