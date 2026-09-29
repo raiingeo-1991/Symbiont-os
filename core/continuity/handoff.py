@@ -37,6 +37,51 @@ class BodyHandoffManager:
         self.ledger = ledger
         self.state = state or ContinuityState()
         self.bodies: Dict[str, BodyIdentity] = {}
+        self._restore_bodies_from_ledger()
+
+    def _restore_bodies_from_ledger(self) -> None:
+        """Rebuild the in-memory body registry from the existing ledger."""
+        for event in self.ledger.events():
+            event_type = event.event_type
+            payload = event.payload or {}
+
+            if event_type == "BODY_REGISTERED":
+                body_data = payload.get("body")
+                if not body_data:
+                    continue
+
+                body = BodyIdentity.from_dict(body_data)
+                self.bodies[body.body_id] = body
+
+            elif event_type == "BODY_ATTACHED":
+                body_id = payload.get("target_body_id") or event.body_id
+                if body_id in self.bodies:
+                    body = self.bodies[body_id]
+                    body.status = (
+                        BodyStatus.ACTIVE
+                        if self.state.active_body == body_id
+                        else BodyStatus.ATTACHED
+                    )
+
+            elif event_type == "BODY_DETACHED":
+                body_id = payload.get("body_id") or event.body_id
+                if body_id in self.bodies:
+                    self.bodies[body_id].status = BodyStatus.DETACHED
+
+            elif event_type == "BODY_HANDOFF":
+                source_id = payload.get("source_body_id")
+                target_id = payload.get("target_body_id") or event.body_id
+
+                if source_id in self.bodies:
+                    self.bodies[source_id].status = BodyStatus.DETACHED
+
+                if target_id in self.bodies:
+                    self.bodies[target_id].status = BodyStatus.ACTIVE
+
+            elif event_type == "BODY_REVOKED":
+                body_id = payload.get("body_id") or event.body_id
+                if body_id in self.bodies:
+                    self.bodies[body_id].status = BodyStatus.REVOKED
 
     def register(self, body: BodyIdentity) -> BodyIdentity:
         if body.body_id in self.bodies:

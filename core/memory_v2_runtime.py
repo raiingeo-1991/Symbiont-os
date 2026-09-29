@@ -172,12 +172,7 @@ class MemoryV2Runtime:
                     "memory",
                 )
                 or "memory",
-                metadata={
-                    "memory_id": item_id,
-                    "source": item.metadata.get(
-                        "source"
-                    ),
-                },
+                metadata=dict(item.metadata),
                 node_id=item_id,
             )
 
