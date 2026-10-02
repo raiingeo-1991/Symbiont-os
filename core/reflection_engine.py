@@ -47,6 +47,17 @@ class ReflectionEngine:
     )
 
     # Words carrying little information for pattern comparison.
+    # Explicit temporal markers. Temporal detection remains conservative:
+    # without a temporal marker, lexical differences are not enough to
+    # conclude that the underlying state has changed.
+    TEMPORAL_MARKERS = (
+        "теперь",
+        "сейчас",
+        "раньше",
+        "прежде",
+        "ранее",
+    )
+
     STOP_WORDS = {
         "я",
         "мне",
@@ -131,6 +142,152 @@ class ReflectionEngine:
 
         return len(a_tokens & b_tokens) / len(union)
 
+    def _temporal_trajectory_candidate(
+        self,
+        clean: list[str],
+    ) -> ReflectionCandidate | None:
+        """
+        Detect a sequence of stable states and their transitions.
+
+        Temporal markers are treated as temporal metadata rather than
+        part of the underlying state. Consecutive identical normalized
+        states are collapsed into one state.
+        """
+        if len(clean) < 4:
+            return None
+
+        state_groups: list[dict[str, Any]] = []
+        current_signature: str | None = None
+
+        for text in clean:
+            tokens = self._tokens(text)
+            tokens -= set(self.TEMPORAL_MARKERS)
+
+            if not tokens:
+                continue
+
+            signature = " ".join(sorted(tokens))
+            has_temporal_marker = any(
+                marker in self._tokens(text)
+                for marker in self.TEMPORAL_MARKERS
+            )
+
+            if not state_groups:
+                state_groups.append({
+                    "signature": signature,
+                    "evidence": [text],
+                })
+                current_signature = signature
+                continue
+
+            # A trajectory state changes only when the observation
+            # explicitly anchors the change in time. Plain paraphrases
+            # are treated as additional evidence for the current state.
+            if has_temporal_marker and signature != current_signature:
+                state_groups.append({
+                    "signature": signature,
+                    "evidence": [text],
+                })
+                current_signature = signature
+            else:
+                # Repeated observation confirms the current state.
+                # It is evidence, not a new state or transition.
+                state_groups[-1]["evidence"].append(text)
+
+        if len(state_groups) < 2:
+            return None
+
+        states = [group["signature"] for group in state_groups]
+        transitions = []
+
+        for previous, current in zip(states, states[1:]):
+            transitions.append({
+                "from": previous,
+                "to": current,
+                "similarity": self._similarity(previous, current),
+            })
+
+        return ReflectionCandidate(
+            content=clean[-1],
+            confidence=0.65,
+            evidence=list(clean),
+            source="reflection",
+            status="candidate",
+            metadata={
+                "observations": len(clean),
+                "method": "temporal_trajectory",
+                "state_count": len(states),
+                "transition_count": len(transitions),
+                "states": states,
+                "transitions": transitions,
+            },
+        )
+
+    def _temporal_change_candidate(
+        self,
+        clean: list[str],
+    ) -> ReflectionCandidate | None:
+        """
+        Detect a simple temporal state change.
+
+        This is intentionally conservative: a previous state must
+        have appeared at least twice before a different current state
+        is treated as a temporal change.
+        """
+        if len(clean) < 3:
+            return None
+
+        current = clean[-1]
+        previous = clean[-2]
+
+        normalized_current = self._normalize(current)
+        if not any(
+            marker in normalized_current
+            for marker in self.TEMPORAL_MARKERS
+        ):
+            return None
+
+        current_signature = self._signature(current)
+        previous_signature = self._signature(previous)
+
+        if not current_signature or not previous_signature:
+            return None
+
+        if current_signature == previous_signature:
+            return None
+
+        previous_count = sum(
+            1
+            for text in clean[:-1]
+            if self._signature(text) == previous_signature
+        )
+
+        if previous_count < 2:
+            return None
+
+        similarity = self._similarity(
+            current_signature,
+            previous_signature,
+        )
+
+        if similarity < 0.35:
+            return None
+
+        return ReflectionCandidate(
+            content=current,
+            confidence=0.65,
+            evidence=[previous, current],
+            source="reflection",
+            status="candidate",
+            metadata={
+                "observations": len(clean),
+                "method": "temporal_change",
+                "previous": previous,
+                "current": current,
+                "similarity": similarity,
+            },
+        )
+
     def reflect(
         self,
         experiences: list[str],
@@ -185,6 +342,17 @@ class ReflectionEngine:
                 groups.append([text])
 
         candidates = []
+
+        temporal_trajectory = self._temporal_trajectory_candidate(clean)
+        if temporal_trajectory is not None:
+            candidates.append(temporal_trajectory)
+
+        temporal_candidate = self._temporal_change_candidate(clean)
+        if temporal_candidate is not None:
+            candidates.append(temporal_candidate)
+
+        if temporal_trajectory is not None or temporal_candidate is not None:
+            groups = []
 
         for group in groups:
             observations = len(group)

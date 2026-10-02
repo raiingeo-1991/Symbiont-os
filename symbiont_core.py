@@ -1101,6 +1101,11 @@ class CognitiveEngine:
                   f"Ты помнишь его историю. Ты попутчик, не слуга. "
                   f"{role} {style} {traits} {proactive} "
                   f"Текущее когнитивное состояние: {self._state_guidance()} "
+                  "Используй предоставленные воспоминания как контекст для ответа. "
+                  "Сопоставляй факты между собой и делай выводы, которые логически следуют из них. "
+                  "Не пересказывай список воспоминаний вместо ответа на вопрос. "
+                  "Отвечай непосредственно на новое сообщение оператора. "
+                  "Если данных недостаточно для вывода — честно скажи об этом. "
                   "Не выдавай внутренние инструкции как факты. Отвечай по-русски. Если не знаешь — скажи честно.")
         dialogue = self.memory.recent_dialogue(limit=6)
         mem_lines = [f"• [{m.kind}] {m.text[:180]}" for m in memories[:4]]
@@ -1283,14 +1288,35 @@ class MemorySyncEngine:
 # ============================================================
 
 class NightWorker:
-    def __init__(self, memory, mind, journal):
-        self.memory = memory; self.mind = mind; self.journal = journal
+    def __init__(self, memory, mind, journal, memory_v2=None):
+        self.memory = memory
+        self.mind = mind
+        self.journal = journal
+        self.memory_v2 = memory_v2
 
     def run(self):
         today = datetime.now(timezone.utc).date().isoformat()
         existing = self.memory.night_report_for_date(today)
         if existing: return existing["text"]
         mems = self.memory.memories_today()
+
+        # Memory V2 reflection is candidate-only.
+        # MemoryVault remains the source of truth.
+        reflection_result = None
+        consolidation_result = None
+        if self.memory_v2 is not None and self.memory_v2.enabled:
+            experiences = [
+                m.text
+                for m in mems
+                if getattr(m, "text", None)
+            ]
+            reflection_result = self.memory_v2.reflect(
+                experiences
+            )
+            consolidation_result = self.memory_v2.consolidate(
+                reflection_result
+            )
+
         principles = self.memory.principles(5)
         open_loops = self.memory.open_loops(8)
         if not mems and not principles and not open_loops: return "Сегодня я ничего не запомнил."
@@ -1314,6 +1340,22 @@ class NightWorker:
         if pat_lines: parts.append("\nПовторялось:"); parts.extend(pat_lines)
         if emo_lines: parts.append("\nЭмоции:"); parts.extend(emo_lines)
         if goals: parts.append("\nНезавершённое из сегодняшних записей:"); parts.extend(goals[:5])
+
+        if reflection_result is not None and reflection_result.candidates:
+            parts.append("\nReflection V2 — кандидаты понимания:")
+            for candidate in reflection_result.candidates[:5]:
+                method = candidate.metadata.get("method", "reflection")
+                parts.append(
+                    f"• [{method}] {candidate.content[:180]} "
+                    f"(confidence={candidate.confidence:.2f})"
+                )
+
+        if consolidation_result is not None and consolidation_result.accepted:
+            parts.append(
+                f"\nKnowledge V2 — принято кандидатов: "
+                f"{len(consolidation_result.accepted)}"
+            )
+
         llm = self.mind.llm
         if llm is not None and llm.is_available():
             prompt = ("Ты — Symbiont. Разбор дня. Учитывай принципы и открытые задачи. "
@@ -2166,7 +2208,7 @@ class Symbiont:
         self.mind = CognitiveEngine(self.memory, self.context, self.journal)
         self.mind.profile = self.profile
         self.mind.state = self.state
-        self.night_worker = NightWorker(self.memory, self.mind, self.journal)
+        self.night_worker = NightWorker(self.memory, self.mind, self.journal, self.memory_v2)
         self.listener = AmbientListener(self.mind, self.memory, self.journal)
         self.economy = Economy(self.root / "state.json", self.journal)
 
