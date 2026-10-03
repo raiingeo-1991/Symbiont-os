@@ -16,7 +16,6 @@ import socket
 import sqlite3
 import threading
 import time
-import urllib.request
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
@@ -44,14 +43,6 @@ try:
 except Exception:
     MemoryIntegrity = None
 
-try:
-    from core.node_identity import get_node_identity
-    from core.crypto_protocol import SCP1
-    from core.scp1_zerotrust import get_scp1_zerotrust
-except Exception:
-    get_node_identity = None
-    SCP1 = None
-    get_scp1_zerotrust = None
 
 SMSA_PERMISSION_MAP = {
     "microphone": "microphone.listen",
@@ -72,10 +63,6 @@ except Exception:
 
 CORE_VERSION = "11.0"
 
-try:
-    from core.llm_openai import OpenAIProvider
-except Exception:
-    OpenAIProvider = None
 ROOT_DIR = Path("symbiont_data")
 MAX_MEMORY_RESULTS = 12
 DEFAULT_FOOD_BUDGET = 10.0
@@ -83,8 +70,6 @@ CURRENCY = "SYM"
 DECAY_PER_DAY = 0.15
 DECAY_MIN_WEIGHT = 1.5
 RECALL_BOOST = 0.3
-DEFAULT_LLM_URL = "http://localhost:11434"
-DEFAULT_LLM_MODEL = "llama3.2"
 LISTEN_MIN_LENGTH = 4
 LISTEN_DEBOUNCE_SEC = 0.5
 P2P_UDP_PORT = 50999
@@ -265,51 +250,6 @@ class EventJournal:
                         except Exception: pass
         return events
 
-
-# ============================================================
-# LLM
-# ============================================================
-
-class LLMProvider:
-    name = "base"
-    def is_available(self): return False
-    def chat(self, messages, timeout=60.0): return None
-    def list_models(self): return []
-
-
-class OllamaProvider(LLMProvider):
-    name = "ollama"
-    def __init__(self, url=DEFAULT_LLM_URL, model=DEFAULT_LLM_MODEL):
-        self.url = url.rstrip("/"); self.model = model
-
-    def _post(self, path, payload, timeout):
-        try:
-            req = urllib.request.Request(self.url + path,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception: return None
-
-    def _get(self, path, timeout=5.0):
-        try:
-            req = urllib.request.Request(self.url + path, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception: return None
-
-    def is_available(self): return self._get("/api/tags", timeout=3.0) is not None
-
-    def list_models(self):
-        d = self._get("/api/tags")
-        if not d: return []
-        return [m.get("name", "?") for m in d.get("models", [])]
-
-    def chat(self, messages, timeout=60.0):
-        payload = {"model": self.model, "messages": messages, "stream": False}
-        d = self._post("/api/chat", payload, timeout)
-        if not d: return None
-        return d.get("message", {}).get("content", "")
 
 
 # ============================================================
@@ -1456,42 +1396,6 @@ class P2PNetwork:
         self.node = node; self.udp_port = udp_port; self.tcp_port = tcp_port
         self.running = False
 
-        # Existing SCP-1 identity/security attached to P2P.
-        self.scp_identity = (
-            get_node_identity()
-            if get_node_identity is not None
-            else None
-        )
-
-        trusted_raw = os.getenv(
-            "SYMBIONT_SCP1_TRUSTED_NODES",
-            "",
-        )
-
-        trusted_nodes = [
-            item.strip()
-            for item in trusted_raw.split(",")
-            if item.strip()
-        ]
-
-        self.scp1 = (
-            get_scp1_zerotrust(
-                trusted_nodes=trusted_nodes
-            )
-            if get_scp1_zerotrust is not None
-            else None
-        )
-
-        # SCP-1 P2P transport remains opt-in for now.
-        self.scp1_enabled = (
-            os.getenv(
-                "SYMBIONT_SCP1_P2P",
-                "0",
-            )
-            .strip()
-            .lower()
-            in {"1", "true", "yes", "on"}
-        )
 
     def start(self):
         self.running = True
@@ -1501,54 +1405,6 @@ class P2PNetwork:
 
     def stop(self): self.running = False
 
-    def _scp1_wrap(self, payload, message_type="P2P"):
-        if (
-            not self.scp1_enabled
-            or self.scp_identity is None
-            or SCP1 is None
-        ):
-            return None
-
-        packet = SCP1.build_payload(
-            node_id=self.scp_identity.node_id,
-            public_key=self.scp_identity.public_key,
-            payload=payload,
-            capability="network.send",
-            message_type=message_type,
-        )
-
-        packet = SCP1.sign(
-            self.scp_identity.private_key,
-            packet,
-        )
-
-        return {"scp1": packet}
-
-    def _scp1_unwrap(self, wire):
-        if (
-            not self.scp1_enabled
-            or self.scp1 is None
-            or SCP1 is None
-        ):
-            return None
-
-        if not isinstance(wire, dict):
-            return None
-
-        packet = wire.get("scp1")
-
-        if not isinstance(packet, dict):
-            return None
-
-        if not self.scp1.verify(packet):
-            return None
-
-        payload = packet.get("payload")
-
-        if not isinstance(payload, dict):
-            return None
-
-        return payload
 
     def _udp_beacon(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1623,21 +1479,7 @@ class P2PNetwork:
                 data.decode("utf-8")
             )
 
-            # SCP-1 becomes the authenticated network envelope
-            # when explicitly enabled.
-            if self.scp1_enabled:
-                req = self._scp1_unwrap(wire)
-
-                if req is None:
-                    conn.sendall(
-                        canonical_json({
-                            "status": "UNAUTHORIZED",
-                            "reason": "scp1",
-                        }).encode()
-                    )
-                    return
-            else:
-                req = wire
+            req = wire
 
             # Keep existing Core Identity verification for
             # compatibility with the current P2P protocol.
@@ -1657,14 +1499,6 @@ class P2PNetwork:
                     "status": "UNAUTHORIZED"
                 }
 
-                if self.scp1_enabled:
-                    wrapped = self._scp1_wrap(
-                        response,
-                        message_type="RESPONSE",
-                    )
-
-                    if wrapped is not None:
-                        response = wrapped
 
                 conn.sendall(
                     canonical_json(response).encode()
@@ -1687,14 +1521,6 @@ class P2PNetwork:
                     "status": "UNKNOWN"
                 }
 
-            if self.scp1_enabled:
-                wrapped = self._scp1_wrap(
-                    resp,
-                    message_type="RESPONSE",
-                )
-
-                if wrapped is not None:
-                    resp = wrapped
 
             conn.sendall(
                 canonical_json(resp).encode()
@@ -1730,20 +1556,7 @@ class P2PNetwork:
                 (peer.address, peer.tcp_port)
             )
 
-            if self.scp1_enabled:
-                wire = self._scp1_wrap(
-                    packet,
-                    message_type=packet.get(
-                        "action",
-                        "P2P",
-                    ),
-                )
-
-                if wire is None:
-                    s.close()
-                    return None
-            else:
-                wire = packet
+            wire = packet
 
             s.sendall(
                 canonical_json(wire).encode("utf-8")
@@ -1756,8 +1569,6 @@ class P2PNetwork:
                 data.decode("utf-8")
             )
 
-            if self.scp1_enabled:
-                return self._scp1_unwrap(response)
 
             return response
 
@@ -2258,7 +2069,6 @@ class Symbiont:
         self.mind.connect_tools(self.tools)
         self.sync_engine = MemorySyncEngine(self)
         self.llm_provider = None
-        self._load_llm_config()
         self.started_at = now_iso()
         self.journal.append("symbiont.initialized",
                             {"version": CORE_VERSION, "id": self.identity.id()})
@@ -2300,61 +2110,15 @@ class Symbiont:
             self._sync_permission_to_smsa(core_cap, value)
 
 
-    def _save_llm_config(self, provider, url="", model=""):
-        atomic_write(self.root / "llm.json",
-                     json.dumps({"provider": provider, "url": url, "model": model},
-                                ensure_ascii=False, indent=2))
-
-    def _load_llm_config(self):
-        cfg = self.root / "llm.json"
-        if not cfg.exists():
-            return
-        try:
-            d = json.loads(cfg.read_text(encoding="utf-8"))
-            provider = d.get("provider", "")
-            url = d.get("url", DEFAULT_LLM_URL)
-            model = d.get("model", DEFAULT_LLM_MODEL)
-            if provider == "openai":
-                self.llm_provider = OpenAIProvider(url=url, model=model)
-                self.mind.connect_llm(self.llm_provider)
-            elif provider == "ollama":
-                self.llm_provider = OllamaProvider(url=url, model=model)
-                self.mind.connect_llm(self.llm_provider)
-        except Exception:
-            pass
-
-    def llm_enable(self, url=DEFAULT_LLM_URL, model=DEFAULT_LLM_MODEL):
-        if OpenAIProvider is not None:
-            p = OpenAIProvider(url=url, model=model)
-            if p.is_available():
-                self.llm_provider = p
-                self.mind.connect_llm(p)
-                self._save_llm_config("openai", url, model)
-                return True, f"LLM: {url} / {model}"
-        p = OllamaProvider(url=url, model=model)
-        if not p.is_available():
-            return False, f"LLM недоступен по {url}"
-        self.llm_provider = p
-        self.mind.connect_llm(p)
-        self._save_llm_config("ollama", url, model)
-        return True, f"Ollama: {url} / {model}"
-
+    def llm_enable(self, *args, **kwargs):
+        return False, "LLM удалён из этой сборки."
 
     def llm_disable(self):
         self.llm_provider = None
         self.mind.connect_llm(None)
-        self._save_llm_config("none")
 
     def llm_status(self):
-        if self.llm_provider is None:
-            return {"enabled": False}
-        return {
-            "enabled": True,
-            "name": self.llm_provider.name,
-            "available": self.llm_provider.is_available(),
-            "url": getattr(self.llm_provider, "url", "?"),
-            "model": getattr(self.llm_provider, "model", "?"),
-        }
+        return {"enabled": False, "removed": True}
 
     def speak(self, text): return self.mind.think(text)
 
@@ -2558,19 +2322,8 @@ class Shell:
             print("listen on | listen off"); return True
 
         if cmd == "llm":
-            a = arg.strip().lower()
-            if not a or a == "status":
-                print(json.dumps(self.sym.llm_status(), ensure_ascii=False, indent=2)); return True
-            if a.startswith("on"):
-                parts = arg.split()
-                url = parts[1] if len(parts) > 1 else DEFAULT_LLM_URL
-                model = parts[2] if len(parts) > 2 else DEFAULT_LLM_MODEL
-                ok, msg = self.sym.llm_enable(url=url, model=model); print(msg); return True
-            if a == "off": self.sym.llm_disable(); print("LLM отключён."); return True
-            if a == "models":
-                if self.sym.llm_provider is None: print("LLM не подключён."); return True
-                m = self.sym.llm_provider.list_models(); print("Модели:", m if m else "(нет)"); return True
-            print("llm [status|on <url> <model>|off|models]"); return True
+            print("LLM удалён из этой сборки.")
+            return True
 
         if cmd in ("name", "имя"):
             if not arg: print(f"Имя: {self.sym.profile.name()}"); return True
