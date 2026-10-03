@@ -23,7 +23,6 @@ X-Class does not own:
 
 - Identity
 - MemoryVault
-- Memory V2
 - CognitiveState
 - EventJournal
 - Economy
@@ -90,7 +89,6 @@ X-Class must not:
 - directly access Identity
 - directly access CognitiveState
 - directly access EventJournal
-- directly access Memory V2
 - become the owner of Symbiont identity or memory
 
 ## Existing integration point

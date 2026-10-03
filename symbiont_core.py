@@ -33,15 +33,7 @@ except Exception:
     SMSA = None
     get_secure_settlement = None
 
-try:
-    from core.memory_v2_runtime import MemoryV2Runtime
-except Exception:
-    MemoryV2Runtime = None
 
-try:
-    from core.memory_integrity import MemoryIntegrity
-except Exception:
-    MemoryIntegrity = None
 
 
 SMSA_PERMISSION_MAP = {
@@ -1178,11 +1170,10 @@ class MemorySyncEngine:
 # ============================================================
 
 class NightWorker:
-    def __init__(self, memory, mind, journal, memory_v2=None):
+    def __init__(self, memory, mind, journal):
         self.memory = memory
         self.mind = mind
         self.journal = journal
-        self.memory_v2 = memory_v2
 
     def run(self):
         today = datetime.now(timezone.utc).date().isoformat()
@@ -1190,76 +1181,10 @@ class NightWorker:
         if existing: return existing["text"]
         mems = self.memory.memories_today()
 
-        # Memory V2 reflection is candidate-only.
         # MemoryVault remains the source of truth.
         reflection_result = None
         consolidation_result = None
-        if self.memory_v2 is not None and self.memory_v2.enabled:
-            experiences = [
-                m.text
-                for m in mems
-                if getattr(m, "text", None)
-            ]
-            reflection_result = self.memory_v2.reflect(
-                experiences
-            )
-            consolidation_result = self.memory_v2.consolidate(
-                reflection_result
-            )
 
-        principles = self.memory.principles(5)
-        open_loops = self.memory.open_loops(8)
-        if not mems and not principles and not open_loops: return "Сегодня я ничего не запомнил."
-        diary = [f"• {m.text[:150]}" for m in mems if m.kind in ("dialog", "general", "experience")]
-        pat = self.mind.notice_words(limit=30, min_count=2)
-        pat_lines = [f"• «{w}» — {c}" for w, c in pat[:5]]
-        emo = self.mind.notice_emotions(limit=30)
-        emo_lines = [f"• {e} — {c}" for e, c in emo[:5]]
-        goals = []
-        for m in mems:
-            if m.kind not in ("dialog", "general", "experience"):
-                continue
-            if any(mk in m.text.lower() for mk in ("хочу", "надо", "должен", "планирую", "нужно")):
-                goals.append(f"• {m.text[:150]}")
-        parts = [f"Разбор дня {today}:", f"\nЗаписей: {len(mems)}"]
-        if principles:
-            parts.append("\nПринципы:"); parts.extend(f"• {m.text[:150]}" for m in principles)
-        if open_loops:
-            parts.append("\nОткрытые задачи:"); parts.extend(f"• {m.text[:150]}" for m in open_loops)
-        if diary: parts.append("\nЧто было:"); parts.extend(diary[:10])
-        if pat_lines: parts.append("\nПовторялось:"); parts.extend(pat_lines)
-        if emo_lines: parts.append("\nЭмоции:"); parts.extend(emo_lines)
-        if goals: parts.append("\nНезавершённое из сегодняшних записей:"); parts.extend(goals[:5])
-
-        if reflection_result is not None and reflection_result.candidates:
-            parts.append("\nReflection V2 — кандидаты понимания:")
-            for candidate in reflection_result.candidates[:5]:
-                method = candidate.metadata.get("method", "reflection")
-                parts.append(
-                    f"• [{method}] {candidate.content[:180]} "
-                    f"(confidence={candidate.confidence:.2f})"
-                )
-
-        if consolidation_result is not None and consolidation_result.accepted:
-            parts.append(
-                f"\nKnowledge V2 — принято кандидатов: "
-                f"{len(consolidation_result.accepted)}"
-            )
-
-        llm = self.mind.llm
-        if llm is not None and llm.is_available():
-            prompt = ("Ты — Symbiont. Разбор дня. Учитывай принципы и открытые задачи. "
-                      "Выдели важное, повторяющееся и следующий безопасный шаг. 5-7 предложений. "
-                      "Не выдавай предположение за факт.\n\n" + "\n".join(parts))
-            ans = llm.chat([{"role": "user", "content": prompt}], timeout=120.0)
-            if ans: parts.append("\nРазмышление:"); parts.append(ans.strip())
-        text = "\n".join(parts)
-        self.memory.save_night_report(today, text)
-        # Night worker turns explicit unresolved intent into durable open-loop memory.
-        for goal in goals[:5]:
-            clean = goal.lstrip("• ").strip()
-            if clean and not any(clean.lower() in m.text.lower() for m in open_loops):
-                self.memory.remember(clean, kind="open_loop", importance=7, source="night_worker", tags=["night", "open_loop"])
         return text
 
 
@@ -1946,30 +1871,12 @@ class Symbiont:
         self.bodies = Bodies(self.root / "bodies.json")
         self.memory = MemoryVault(self.root / "memory.sqlite3", self.journal)
 
-        # Memory Integrity: read-only контроль целостности MemoryVault.
-        # MemoryVault остаётся источником истины.
-        self.memory_integrity = None
-        if MemoryIntegrity is not None:
-            self.memory_integrity = MemoryIntegrity(
-                self.memory,
-                self.root / "memory.integrity.json",
-            )
-
-        # Memory V2: shadow-контур ассоциаций/рефлексии.
-        # MemoryVault остаётся источником истины.
-        self.memory_v2 = None
-        if MemoryV2Runtime is not None:
-            self.memory_v2 = MemoryV2Runtime(
-                self.memory,
-                enabled=None,
-                shadow=True,
-            )
 
         self.context = ContextBus()
         self.mind = CognitiveEngine(self.memory, self.context, self.journal)
         self.mind.profile = self.profile
         self.mind.state = self.state
-        self.night_worker = NightWorker(self.memory, self.mind, self.journal, self.memory_v2)
+        self.night_worker = NightWorker(self.memory, self.mind, self.journal)
         self.listener = AmbientListener(self.mind, self.memory, self.journal)
         self.economy = Economy(self.root / "state.json", self.journal)
 

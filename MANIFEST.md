@@ -195,25 +195,6 @@ It provides the environment in which the Symbiont can operate.
 
 ---
 
-# 9. Android Body
-
-Android is currently the first practical Body implementation.
-
-The Android layer provides interfaces for capabilities such as:
-
-- Text-to-speech
-- Speech-to-text
-- Notifications
-- Vibration
-- Battery information
-- Network communication
-
-Some capabilities depend on the Android version, installed components and permissions.
-
-The Android Body is therefore an adapter to the device environment, not the Symbiont itself.
-
----
-
 # 10. Permissions
 
 Capabilities are not automatically trusted.
@@ -674,24 +655,6 @@ SCA-1 observes and records continuity; it does not replace the application Core.
 
 # 28. Security and Integration Boundaries
 
-## SCP-1
-
-SCP-1 provides an authenticated protocol layer and Zero-Trust verification.
-
-**NodeIdentity → SCP-1 → Zero-Trust verification → P2P envelope → Core P2P handling**
-
-SCP-1 does not replace the P2P transport layer.
-
-Discovery and trust are separate concepts.
-
-Optional P2P integration:
-
-```bash
-export SYMBIONT_SCP1_P2P=1
-```
-
-Trusted nodes are configured separately.
-
 ## SMSA Security
 
 SMSA provides an additional security and authorization boundary for supported capabilities and settlement operations.
@@ -718,19 +681,14 @@ Permissions remain explicit and are not automatically granted by network discove
 
 The canonical Symbiont line currently contains a working integrated foundation:
 
-- persistent memory and Memory V2;
 - persistent identity and recovery;
 - Cognitive Engine;
 - EventJournal;
 - Quest system;
 - P2P network;
-- optional SCP-1 authenticated P2P integration;
-- Zero-Trust verification;
 - SMSA security integration;
 - PermissionGate;
 - Economy and Escrow;
-- Android Body / Bridge;
-- local LLM integration;
 - background and proactive processing;
 - optional SCA-1 Continuity Shadow;
 - XLink adapter;

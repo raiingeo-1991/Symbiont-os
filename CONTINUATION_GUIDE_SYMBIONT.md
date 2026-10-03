@@ -42,12 +42,9 @@ execution environment / Body / process продолжать деятельнос
 
 без "начала с нуля".
 
-LLM не является самим Symbiont.
 
-LLM должен рассматриваться как дополнительный
 интеллектуальный/языковой усилитель.
 
-При отключении или замене LLM:
 Identity, Memory, State, principles и история
 не должны исчезать.
 
@@ -179,45 +176,6 @@ MemoryVault также содержит:
 
 ---
 
-# 8. MEMORY V2
-
-Memory V2 работает в shadow mode.
-
-Основной runtime:
-
-    core/memory_v2_runtime.py
-
-Существующие операции:
-
-    refresh()
-    search()
-    spread()
-    build_experience_graph()
-    reflect()
-    consolidate()
-    decay()
-
-MemoryVault остаётся source of truth.
-
-Memory V2 не должен незаметно переписывать Core.
-
----
-
-# 9. ASSOCIATIVE MEMORY
-
-Существующий AssociativeMemory использует
-лексическое сходство и activation.
-
-Основной поиск основан на token/Jaccard similarity
-с дополнительными boost-механизмами.
-
-Это НЕ полноценное semantic understanding.
-
-Важно не называть существующий механизм semantic retrieval
-без отдельного доказательства.
-
----
-
 # 10. EXPERIENCE GRAPH
 
 ExperienceGraph хранит:
@@ -228,7 +186,6 @@ ExperienceGraph хранит:
 Graph поддерживает metadata.
 
 В текущем эксперименте metadata теперь передаётся
-из Memory V2 в graph целиком.
 
 Это важно для будущего temporal analysis.
 
@@ -346,50 +303,6 @@ KnowledgeConsolidation уже существует.
 
 ---
 
-## Memory V2
-
-Последний тест:
-
-    11/11 PASSED
-
-Включает:
-
-- shadow pipeline;
-- real MemoryVault refresh;
-- graph;
-- reflection candidate-only;
-- read-only search;
-- read-only decay;
-- 30k stress.
-
-Stress:
-
-    30,000 memories
-    Indexed: 30,000
-    Links: 0
-    100 searches: 1000 results
-    Spread: 5 results
-    Decay: processed 500
-    changed: 0
-    deleted: 0
-    destructive: False
-
-MemoryVault:
-
-    BEFORE: 30000
-    AFTER:  30000
-
-Python:
-
-    current: 32.32 MB
-    peak:    63.05 MB
-
-Есть ResourceWarning о незакрытых sqlite connections.
-Это технический долг.
-Не считать тест проваленным.
-
----
-
 # 15. FIRST ACQUAINTANCE
 
 Проверена идея первого знакомства.
@@ -404,7 +317,6 @@ Q01–Q06 были сохранены как owner memories
 
 MemoryVault сохранил их после restart.
 
-Memory V2 также восстановил их.
 
 ExperienceGraph сохранил metadata.
 
@@ -643,7 +555,6 @@ Reflection/temporal logic.
 
     CHECKPOINT_2026-09-29_LEARNING-FIRST-ACQUAINTANCE.md
     core/continuity/handoff.py
-    core/memory_v2_runtime.py
     tests/test_sca1_body_registry_restart.py
 
 ---
@@ -684,29 +595,6 @@ symbiont-clean-run — T0 control baseline.
     CHECKPOINT_2026-09-28_FULL-CONTINUITY-BODY.md
     CHECKPOINT_2026-09-28_TIME-PROACTIVE-CONTINUITY.md
     CHECKPOINT_2026-09-29_LEARNING-FIRST-ACQUAINTANCE.md
-
----
-
-# 28. TERMUX WORKFLOW
-
-Владелец предпочитает получать сразу
-несколько следующих команд.
-
-Обычно давать три команды подряд.
-
-Если пользователь пишет:
-
-    "ок"
-
-это означает:
-
-    продолжить к следующему шагу.
-
-Если появляется ошибка:
-
-    остановиться,
-    разобрать вывод,
-    не придумывать следующий шаг вслепую.
 
 ---
 

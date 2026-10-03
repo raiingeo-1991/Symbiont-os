@@ -22,17 +22,12 @@ Roadmap описывает направление развития Symbiont.
 - persistent Identity;
 - persistent Memory;
 - EventJournal;
-- Memory V2 components;
-- Cognition / LLM integration;
 - Quest system;
 - P2P discovery and communication;
 - Economy and Escrow;
 - SecureSettlement;
 - PermissionGate;
 - SMSA security integration;
-- SCP-1 cryptographic protocol;
-- SCP-1 Zero-Trust verification;
-- optional SCP-1 ↔ P2P integration;
 - SCA-1 Continuity Shadow;
 - Body / Bridge integration;
 - integration and regression tests.
@@ -55,13 +50,11 @@ SCA-1 работает как опциональный Shadow-контур:
 
 ### Security
 
-Проверены SCP-1 identity, подписи, replay protection, trusted nodes, Zero-Trust состояние и интеграция с P2P.
 
 Проверена совместимость PermissionGate и SMSA.
 
 ### P2P
 
-Проверены discovery, TCP/UDP взаимодействие, SCP-1 envelope и security boundaries.
 
 ### Economy
 
@@ -181,11 +174,9 @@ SCA-1 должен развиваться как отдельный continuity-�
 
 Дальнейшее развитие безопасности должно усиливать существующие границы:
 
-- SCP-1;
 - NodeIdentity;
 - trusted nodes;
 - replay protection;
-- Zero-Trust verification;
 - PermissionGate;
 - SMSA;
 - capability enforcement.
@@ -220,7 +211,6 @@ SCA-1 должен развиваться как отдельный continuity-�
 - переносить всё в Core;
 - создавать новые крупные архитектурные слои;
 - заменять существующий P2P новым протоколом;
-- превращать SCP-1 в сам P2P;
 - заменять SCA-1 новым Core;
 - добавлять функции только ради увеличения количества компонентов;
 - выдавать концептуальные механизмы за реализованные.

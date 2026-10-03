@@ -84,7 +84,6 @@ Memory is one of the foundational ideas of Symbiont.
 
 The system maintains persistent memory instead of treating every application launch as a completely new beginning.
 
-The current implementation includes persistent memory storage, retrieval, journaling and Memory V2 components.
 
 The goal is not simply to store text. The goal is to preserve experience as part of the history of the system.
 
@@ -113,18 +112,6 @@ export SYMBIONT_SCA1_SHADOW=1
 ## Security
 
 Symbiont contains several security boundaries with separate responsibilities.
-
-### SCP-1
-
-SCP-1 provides authenticated protocol envelopes, freshness checks, structure validation and Zero-Trust verification.
-
-Optional P2P integration can be enabled with:
-
-```bash
-export SYMBIONT_SCP1_P2P=1
-```
-
-Discovery and trust remain separate concepts.
 
 ### SMSA
 
@@ -202,7 +189,6 @@ python symbiont_core.py
 
 For the complete startup procedure and integration checks, see [`QUICKSTART.md`](QUICKSTART.md).
 
-If a local LLM is used, it can be started separately through llama.cpp and connected through the configured local endpoint.
 
 ---
 
@@ -213,7 +199,6 @@ If a local LLM is used, it can be started separately through llama.cpp and conne
 - [`QUICKSTART.md`](QUICKSTART.md) — current canonical startup and verification procedure.
 - [`ROADMAP.md`](ROADMAP.md) — development direction.
 - [`docs/SCA-1.md`](docs/SCA-1.md) — continuity architecture and Core Shadow integration.
-- [`docs/SCP-1.md`](docs/SCP-1.md) — authenticated protocol and Zero-Trust integration.
 - [`docs/docs/ECONOMY.md`](docs/docs/ECONOMY.md) — Economy and escrow model.
 - [`docs/QUESTS.md`](docs/QUESTS.md) — Quest model, lifecycle and planned verification mechanisms.
 - [`docs/README.ru.md`](docs/README.ru.md) — Russian documentation entry point.
@@ -252,7 +237,6 @@ Do not treat archived or legacy copies as the active development line.
 
 ## Credits
 
-Some ideas and architectural approaches used in the Memory V2 layer
 were inspired by the work of Artemy Voikhansky (@artemyvo).
 
 Special thanks for the discussion and permission to adapt these ideas

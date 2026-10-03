@@ -15,9 +15,7 @@ cd ~/Symbiont-os
 pwd
 ```
 
-Ожидаемый путь в Termux:
 
-`/data/data/com.termux/files/home/Symbiont-os`
 
 Это текущая локальная source-of-truth линия проекта.
 
@@ -28,42 +26,10 @@ cd ~/Symbiont-os
 python symbiont_core.py
 ```
 
-После запуска Core показывает состояние Symbiont, включая identity, role, style, LLM, P2P и другие активные компоненты.
-
----
-
-## 3. Локальный LLM
-
-Если используется локальная модель через llama.cpp, сначала запусти LLM-сервер в отдельной сессии Termux.
-
-Пример:
-
-```bash
-cd ~/llama.cpp
-./build/bin/llama-server -m ~/models/<model>.gguf --port 11434
-```
-
-После этого в другой сессии Symbiont может подключиться к:
-
-`http://localhost:11434`
-
-Проверка LLM выполняется уже из самого Symbiont.
-
-Если LLM не нужен для конкретного теста, Core может запускаться без него.
 
 ---
 
 ## 4. Проверка интеграций
-
-### SCP-1 + P2P
-
-Опциональная интеграция включается:
-
-```bash
-export SYMBIONT_SCP1_P2P=1
-```
-
-Для SCP-1 должны быть настроены trusted nodes. Discovery и trust остаются разными понятиями.
 
 ### SCA-1 Continuity Shadow
 

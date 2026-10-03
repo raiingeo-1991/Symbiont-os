@@ -25,7 +25,6 @@ Symbiont Core
   Body A / Body B / Body C
 ```
 
-SCA-1 does not replace MemoryVault, Memory V2, Economy, Quest, P2P, Body or
 Bridge.
 
 ## Components
