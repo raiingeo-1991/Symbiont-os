@@ -524,24 +524,6 @@ class MemoryVault:
             """)
             self.db.commit(); self._migrate()
 
-    def _fts5_available(self):
-        """Return True when the bundled SQLite supports FTS5."""
-        try:
-            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.symbiont_fts5_probe USING fts5(x)")
-            self.db.execute("DROP TABLE IF EXISTS temp.symbiont_fts5_probe")
-            return True
-        except Exception:
-            return False
-
-    def _fts_rebuild(self):
-        """Rebuild the FTS index from the canonical memories table."""
-        if not self.fts_available:
-            return
-        self.db.execute("DELETE FROM memory_fts")
-        self.db.execute(
-            "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
-            "SELECT memory_id, text, kind, COALESCE(project, ''), tags, metadata FROM memories"
-        )
 
     def _migrate(self):
         with self.lock:
@@ -554,21 +536,7 @@ class MemoryVault:
                 try: self.db.execute("ALTER TABLE memories ADD COLUMN last_recall TEXT")
                 except Exception: pass
 
-            self.fts_available = self._fts5_available()
-            if self.fts_available:
-                try:
-                    self.db.execute(
-                        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5("
-                        "memory_id UNINDEXED, text, kind, project, tags, metadata, "
-                        "tokenize='unicode61 remove_diacritics 2'"
-                        ")"
-                    )
-                    memory_count = int(self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
-                    fts_count = int(self.db.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0])
-                    if memory_count != fts_count:
-                        self._fts_rebuild()
-                except Exception:
-                    self.fts_available = False
+            self.db.execute("DROP TABLE IF EXISTS memory_fts")
             self.db.commit()
 
     def _decay(self, row):
@@ -591,11 +559,6 @@ class MemoryVault:
                     "INSERT INTO memories (memory_id, text, kind, importance, created_at, updated_at, source, project, tags, metadata, recall_count) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (mem_id, text.strip(), kind, importance, ts, ts, source, project, tags_json, metadata_json))
-                if self.fts_available:
-                    self.db.execute(
-                        "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (mem_id, text.strip(), kind, project or "", tags_json, metadata_json))
                 self.db.commit()
             except Exception:
                 self.db.rollback()
@@ -622,12 +585,6 @@ class MemoryVault:
             rows = self.db.execute("SELECT * FROM links WHERE from_id = ? OR to_id = ?", (mem_id, mem_id)).fetchall()
         return [dict(r) for r in rows]
 
-    def _fts_query(self, query):
-        # FTS5 MATCH is deliberately built from simple prefix tokens so normal
-        # conversational text does not accidentally become FTS syntax.
-        import re
-        tokens = re.findall(r"[\w\u0400-\u04ff]{2,}", str(query).lower(), flags=re.UNICODE)
-        return " OR ".join(f'"{t}"*' for t in tokens[:12])
 
     def _ranking_boost(self, row, exact_query=""):
         kind = str(row["kind"] or "").lower()
@@ -643,39 +600,32 @@ class MemoryVault:
         return boost
 
     def search(self, query, limit=MAX_MEMORY_RESULTS, min_weight=DECAY_MIN_WEIGHT):
-        fts_query = self._fts_query(query)
+        words = [word for word in str(query).lower().split() if len(word) >= 2]
         with self.lock:
-            if self.fts_available and fts_query:
-                rows = self.db.execute(
-                    "SELECT m.*, bm25(memory_fts, 0.0, 6.0, 2.5, 1.5, 0.5) AS fts_score "
-                    "FROM memory_fts JOIN memories m ON m.memory_id = memory_fts.memory_id "
-                    "WHERE memory_fts MATCH ? ORDER BY fts_score LIMIT 500",
-                    (fts_query,)).fetchall()
-            else:
-                rows = self.db.execute(
-                    "SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500").fetchall()
+            rows = self.db.execute(
+                "SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500"
+            ).fetchall()
 
         scored = []
         for row in rows:
-            w = self._decay(row)
-            if w < min_weight: continue
-            if self.fts_available and fts_query:
-                # SQLite FTS5 bm25() returns negative values: more negative is better.
-                # Scale the small default magnitudes into a useful 0..10 signal.
-                raw_bm25 = float(row["fts_score"] or 0.0)
-                fts_score = max(0.0, min(10.0, (-raw_bm25) * 1_000_000.0))
-            else:
-                hay = (str(row["text"]) + " " + str(row["kind"]) + " " + str(row["project"] or "") + " " + str(row["tags"])).lower()
-                fts_score = sum(2.0 for word in str(query).lower().split() if len(word) >= 2 and word in hay)
-                if fts_score <= 0:
-                    continue
-            score = fts_score + w + self._ranking_boost(row, query)
+            weight = self._decay(row)
+            if weight < min_weight:
+                continue
+            haystack = (
+                str(row["text"]) + " " + str(row["kind"]) + " "
+                + str(row["project"] or "") + " " + str(row["tags"])
+            ).lower()
+            match_score = sum(2.0 for word in words if word in haystack)
+            if words and match_score <= 0:
+                continue
+            score = match_score + weight + self._ranking_boost(row, query)
             scored.append((score, row))
 
-        scored.sort(key=lambda x: (x[0], x[1]["updated_at"]), reverse=True)
+        scored.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
         out = []
         for _, row in scored[:limit]:
-            self.mark_recall(row["memory_id"]); out.append(self._to_record(row))
+            self.mark_recall(row["memory_id"])
+            out.append(self._to_record(row))
         return out
 
     def by_kind(self, kind, limit=20, min_weight=DECAY_MIN_WEIGHT):
