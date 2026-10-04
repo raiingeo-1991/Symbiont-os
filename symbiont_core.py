@@ -24,6 +24,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
+    from local_reasoning_adapter import infer_rule_state
+except Exception:
+    infer_rule_state = None
+
+try:
     from core.continuity.shadow import ContinuityShadow
 except Exception:
     ContinuityShadow = None
@@ -704,38 +709,91 @@ class MemoryVault:
 
     def search(self, query, limit=MAX_MEMORY_RESULTS, min_weight=DECAY_MIN_WEIGHT):
         fts_query = self._fts_query(query)
+
         with self.lock:
             if self.fts_available and fts_query:
                 rows = self.db.execute(
                     "SELECT m.*, bm25(memory_fts, 0.0, 6.0, 2.5, 1.5, 0.5) AS fts_score "
                     "FROM memory_fts JOIN memories m ON m.memory_id = memory_fts.memory_id "
                     "WHERE memory_fts MATCH ? ORDER BY fts_score LIMIT 500",
-                    (fts_query,)).fetchall()
+                    (fts_query,),
+                ).fetchall()
             else:
                 rows = self.db.execute(
-                    "SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500").fetchall()
+                    "SELECT * FROM memories "
+                    "ORDER BY importance DESC, updated_at DESC LIMIT 500"
+                ).fetchall()
 
         scored = []
-        for row in rows:
-            w = self._decay(row)
-            if w < min_weight: continue
-            if self.fts_available and fts_query:
-                # SQLite FTS5 bm25() returns negative values: more negative is better.
-                # Scale the small default magnitudes into a useful 0..10 signal.
-                raw_bm25 = float(row["fts_score"] or 0.0)
-                fts_score = max(0.0, min(10.0, (-raw_bm25) * 1_000_000.0))
-            else:
-                hay = (str(row["text"]) + " " + str(row["kind"]) + " " + str(row["project"] or "") + " " + str(row["tags"])).lower()
-                fts_score = sum(2.0 for word in str(query).lower().split() if len(word) >= 2 and word in hay)
+
+        if self.fts_available and fts_query:
+            # FTS remains the primary lexical retrieval path.
+            candidate_rows = {row["memory_id"]: row for row in rows}
+
+            # Persistent fallback candidates are added even when FTS returned
+            # something. This prevents a weak lexical hit from hiding a highly
+            # important memory whose wording differs from the query.
+            with self.lock:
+                fallback_rows = self.db.execute(
+                    "SELECT * FROM memories "
+                    "ORDER BY importance DESC, updated_at DESC LIMIT 80"
+                ).fetchall()
+
+            for row in fallback_rows:
+                candidate_rows.setdefault(row["memory_id"], row)
+
+            for row in candidate_rows.values():
+                w = self._decay(row)
+                if w < min_weight:
+                    continue
+
+                raw_bm25 = float(row["fts_score"] or 0.0) if "fts_score" in row.keys() else 0.0
+
+                # Fallback memories have no FTS score. They still participate
+                # through decay, importance, memory kind and recall history.
+                fts_score = max(
+                    0.0,
+                    min(10.0, (-raw_bm25) * 1_000_000.0),
+                )
+
+                score = fts_score + w + self._ranking_boost(row, query)
+                scored.append((score, row))
+
+        else:
+            for row in rows:
+                w = self._decay(row)
+                if w < min_weight:
+                    continue
+
+                hay = (
+                    str(row["text"]) + " "
+                    + str(row["kind"]) + " "
+                    + str(row["project"] or "") + " "
+                    + str(row["tags"])
+                ).lower()
+
+                fts_score = sum(
+                    2.0
+                    for word in str(query).lower().split()
+                    if len(word) >= 2 and word in hay
+                )
+
                 if fts_score <= 0:
                     continue
-            score = fts_score + w + self._ranking_boost(row, query)
-            scored.append((score, row))
 
-        scored.sort(key=lambda x: (x[0], x[1]["updated_at"]), reverse=True)
+                score = fts_score + w + self._ranking_boost(row, query)
+                scored.append((score, row))
+
+        scored.sort(
+            key=lambda x: (x[0], x[1]["updated_at"]),
+            reverse=True,
+        )
+
         out = []
         for _, row in scored[:limit]:
-            self.mark_recall(row["memory_id"]); out.append(self._to_record(row))
+            self.mark_recall(row["memory_id"])
+            out.append(self._to_record(row))
+
         return out
 
     def by_kind(self, kind, limit=20, min_weight=DECAY_MIN_WEIGHT):
@@ -1127,11 +1185,22 @@ class CognitiveEngine:
         if not memories: memories = self.memory.important(5)
         self.recalculate_motivations()
         source = "local"; response = ""
-        if self.llm is not None and self.llm.is_available():
+
+        # First try deterministic local reasoning over restored memory.
+        local_reasoning = self._local_reasoning(request, memories)
+        if local_reasoning:
+            response = local_reasoning
+            source = "local_reasoning"
+
+        if not response and self.llm is not None and self.llm.is_available():
             ans = self.llm.chat(self._llm_messages(request, memories), timeout=90.0)
-            if ans: response = ans.strip(); source = self.llm.name
+            if ans:
+                response = ans.strip()
+                source = self.llm.name
+
         if not response:
-            response = self._local(request, memories); source = "local"
+            response = self._local(request, memories)
+            source = "local"
         self.memory.record_message("symbiont", response)
         self.journal.append("cognition.completed",
                             {"request_id": rid, "source": source, "proactive": self.proactive})
@@ -1166,6 +1235,93 @@ class CognitiveEngine:
             self.memory.record_message("symbiont", f"[проактивно] {ans}")
             self.journal.append("cognition.proactive_message", {"text": ans[:300]})
         return ans
+
+    def _local_reasoning(self, request, memories):
+        """Локальный вывод с приоритетом самого нового релевантного состояния."""
+        if infer_rule_state is None or not memories:
+            return None
+
+        rules = [m for m in memories if str(m.kind).lower() == "principle"]
+        states = [m for m in memories if str(m.kind).lower() == "general"]
+
+        # Состояния рассматриваются от новых к старым.
+        states = sorted(
+            states,
+            key=lambda m: getattr(m, "created_at", ""),
+            reverse=True,
+        )
+
+        for rule in rules:
+            rule_subject = str(rule.text).lower()
+
+            # Сначала ищем самое новое состояние, относящееся к субъекту
+            # правила. Историческое состояние того же субъекта не может
+            # заменить более новое состояние.
+            rule_result = None
+
+            for state in states:
+                result = infer_rule_state(rule.text, state.text)
+
+                if result is not None:
+                    rule_result = result
+                    break
+
+                # Если состояние явно относится к субъекту правила, но
+                # правило сейчас не выполняется, это является текущим
+                # отрицательным состоянием. Старые состояния больше
+                # не рассматриваем.
+                state_text = str(state.text).lower()
+                subject = result.get("subject") if result else None
+
+                if subject:
+                    continue
+
+                # Для состояний без явного субъекта infer_rule_state()
+                # может вернуть None и при этом не позволить определить,
+                # относится ли состояние к правилу. Такие состояния не
+                # блокируют поиск.
+                if any(token in state_text for token in (
+                    "электричество",
+                    "заряд",
+                    "аккумулятор",
+                    "перегрев",
+                    "температура",
+                )):
+                    if (
+                        "электричеств" in rule_subject
+                        or "заряд" in rule_subject
+                        or "аккумулятор" in rule_subject
+                        or "перегрев" in rule_subject
+                        or "температур" in rule_subject
+                    ):
+                        break
+
+            if rule_result is None:
+                continue
+
+            subject = rule_result.get("subject", "объект")
+            condition = rule_result.get("condition", "")
+            consequence = rule_result.get("consequence", "")
+
+            answer = (
+                f"По сохранённому правилу для {subject}: "
+                f"условие выполнено ({condition}). "
+                f"Следствие: {consequence}."
+            )
+
+            self.journal.append(
+                "cognition.local_reasoning",
+                {
+                    "request": request,
+                    "subject": subject,
+                    "inference": rule_result,
+                    "llm_required": False,
+                },
+            )
+
+            return answer
+
+        return None
 
     def _local(self, request, memories):
         low = request.lower()
