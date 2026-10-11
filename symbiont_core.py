@@ -16,11 +16,17 @@ import socket
 import sqlite3
 import threading
 import time
+import urllib.request
 import uuid
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+try:
+    from local_reasoning_adapter import infer_rule_state
+except Exception:
+    infer_rule_state = None
 
 try:
     from core.continuity.shadow import ContinuityShadow
@@ -33,8 +39,24 @@ except Exception:
     SMSA = None
     get_secure_settlement = None
 
+try:
+    from core.memory_v2_runtime import MemoryV2Runtime
+except Exception:
+    MemoryV2Runtime = None
 
+try:
+    from core.memory_integrity import MemoryIntegrity
+except Exception:
+    MemoryIntegrity = None
 
+try:
+    from core.node_identity import get_node_identity
+    from core.crypto_protocol import SCP1
+    from core.scp1_zerotrust import get_scp1_zerotrust
+except Exception:
+    get_node_identity = None
+    SCP1 = None
+    get_scp1_zerotrust = None
 
 SMSA_PERMISSION_MAP = {
     "microphone": "microphone.listen",
@@ -55,6 +77,10 @@ except Exception:
 
 CORE_VERSION = "11.0"
 
+try:
+    from core.llm_openai import OpenAIProvider
+except Exception:
+    OpenAIProvider = None
 ROOT_DIR = Path("symbiont_data")
 MAX_MEMORY_RESULTS = 12
 DEFAULT_FOOD_BUDGET = 10.0
@@ -62,6 +88,8 @@ CURRENCY = "SYM"
 DECAY_PER_DAY = 0.15
 DECAY_MIN_WEIGHT = 1.5
 RECALL_BOOST = 0.3
+DEFAULT_LLM_URL = "http://localhost:11434"
+DEFAULT_LLM_MODEL = "llama3.2"
 LISTEN_MIN_LENGTH = 4
 LISTEN_DEBOUNCE_SEC = 0.5
 P2P_UDP_PORT = 50999
@@ -242,6 +270,51 @@ class EventJournal:
                         except Exception: pass
         return events
 
+
+# ============================================================
+# LLM
+# ============================================================
+
+class LLMProvider:
+    name = "base"
+    def is_available(self): return False
+    def chat(self, messages, timeout=60.0): return None
+    def list_models(self): return []
+
+
+class OllamaProvider(LLMProvider):
+    name = "ollama"
+    def __init__(self, url=DEFAULT_LLM_URL, model=DEFAULT_LLM_MODEL):
+        self.url = url.rstrip("/"); self.model = model
+
+    def _post(self, path, payload, timeout):
+        try:
+            req = urllib.request.Request(self.url + path,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception: return None
+
+    def _get(self, path, timeout=5.0):
+        try:
+            req = urllib.request.Request(self.url + path, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception: return None
+
+    def is_available(self): return self._get("/api/tags", timeout=3.0) is not None
+
+    def list_models(self):
+        d = self._get("/api/tags")
+        if not d: return []
+        return [m.get("name", "?") for m in d.get("models", [])]
+
+    def chat(self, messages, timeout=60.0):
+        payload = {"model": self.model, "messages": messages, "stream": False}
+        d = self._post("/api/chat", payload, timeout)
+        if not d: return None
+        return d.get("message", {}).get("content", "")
 
 
 # ============================================================
@@ -516,6 +589,24 @@ class MemoryVault:
             """)
             self.db.commit(); self._migrate()
 
+    def _fts5_available(self):
+        """Return True when the bundled SQLite supports FTS5."""
+        try:
+            self.db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.symbiont_fts5_probe USING fts5(x)")
+            self.db.execute("DROP TABLE IF EXISTS temp.symbiont_fts5_probe")
+            return True
+        except Exception:
+            return False
+
+    def _fts_rebuild(self):
+        """Rebuild the FTS index from the canonical memories table."""
+        if not self.fts_available:
+            return
+        self.db.execute("DELETE FROM memory_fts")
+        self.db.execute(
+            "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
+            "SELECT memory_id, text, kind, COALESCE(project, ''), tags, metadata FROM memories"
+        )
 
     def _migrate(self):
         with self.lock:
@@ -528,7 +619,21 @@ class MemoryVault:
                 try: self.db.execute("ALTER TABLE memories ADD COLUMN last_recall TEXT")
                 except Exception: pass
 
-            self.db.execute("DROP TABLE IF EXISTS memory_fts")
+            self.fts_available = self._fts5_available()
+            if self.fts_available:
+                try:
+                    self.db.execute(
+                        "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5("
+                        "memory_id UNINDEXED, text, kind, project, tags, metadata, "
+                        "tokenize='unicode61 remove_diacritics 2'"
+                        ")"
+                    )
+                    memory_count = int(self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+                    fts_count = int(self.db.execute("SELECT COUNT(*) FROM memory_fts").fetchone()[0])
+                    if memory_count != fts_count:
+                        self._fts_rebuild()
+                except Exception:
+                    self.fts_available = False
             self.db.commit()
 
     def _decay(self, row):
@@ -551,6 +656,11 @@ class MemoryVault:
                     "INSERT INTO memories (memory_id, text, kind, importance, created_at, updated_at, source, project, tags, metadata, recall_count) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (mem_id, text.strip(), kind, importance, ts, ts, source, project, tags_json, metadata_json))
+                if self.fts_available:
+                    self.db.execute(
+                        "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (mem_id, text.strip(), kind, project or "", tags_json, metadata_json))
                 self.db.commit()
             except Exception:
                 self.db.rollback()
@@ -577,6 +687,12 @@ class MemoryVault:
             rows = self.db.execute("SELECT * FROM links WHERE from_id = ? OR to_id = ?", (mem_id, mem_id)).fetchall()
         return [dict(r) for r in rows]
 
+    def _fts_query(self, query):
+        # FTS5 MATCH is deliberately built from simple prefix tokens so normal
+        # conversational text does not accidentally become FTS syntax.
+        import re
+        tokens = re.findall(r"[\w\u0400-\u04ff]{2,}", str(query).lower(), flags=re.UNICODE)
+        return " OR ".join(f'"{t}"*' for t in tokens[:12])
 
     def _ranking_boost(self, row, exact_query=""):
         kind = str(row["kind"] or "").lower()
@@ -592,32 +708,92 @@ class MemoryVault:
         return boost
 
     def search(self, query, limit=MAX_MEMORY_RESULTS, min_weight=DECAY_MIN_WEIGHT):
-        words = [word for word in str(query).lower().split() if len(word) >= 2]
+        fts_query = self._fts_query(query)
+
         with self.lock:
-            rows = self.db.execute(
-                "SELECT * FROM memories ORDER BY importance DESC, updated_at DESC LIMIT 500"
-            ).fetchall()
+            if self.fts_available and fts_query:
+                rows = self.db.execute(
+                    "SELECT m.*, bm25(memory_fts, 0.0, 6.0, 2.5, 1.5, 0.5) AS fts_score "
+                    "FROM memory_fts JOIN memories m ON m.memory_id = memory_fts.memory_id "
+                    "WHERE memory_fts MATCH ? ORDER BY fts_score LIMIT 500",
+                    (fts_query,),
+                ).fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT * FROM memories "
+                    "ORDER BY importance DESC, updated_at DESC LIMIT 500"
+                ).fetchall()
 
         scored = []
-        for row in rows:
-            weight = self._decay(row)
-            if weight < min_weight:
-                continue
-            haystack = (
-                str(row["text"]) + " " + str(row["kind"]) + " "
-                + str(row["project"] or "") + " " + str(row["tags"])
-            ).lower()
-            match_score = sum(2.0 for word in words if word in haystack)
-            if words and match_score <= 0:
-                continue
-            score = match_score + weight + self._ranking_boost(row, query)
-            scored.append((score, row))
 
-        scored.sort(key=lambda item: (item[0], item[1]["updated_at"]), reverse=True)
+        if self.fts_available and fts_query:
+            # FTS remains the primary lexical retrieval path.
+            candidate_rows = {row["memory_id"]: row for row in rows}
+
+            # Persistent fallback candidates are added even when FTS returned
+            # something. This prevents a weak lexical hit from hiding a highly
+            # important memory whose wording differs from the query.
+            with self.lock:
+                fallback_rows = self.db.execute(
+                    "SELECT * FROM memories "
+                    "ORDER BY importance DESC, updated_at DESC LIMIT 80"
+                ).fetchall()
+
+            for row in fallback_rows:
+                candidate_rows.setdefault(row["memory_id"], row)
+
+            for row in candidate_rows.values():
+                w = self._decay(row)
+                if w < min_weight:
+                    continue
+
+                raw_bm25 = float(row["fts_score"] or 0.0) if "fts_score" in row.keys() else 0.0
+
+                # Fallback memories have no FTS score. They still participate
+                # through decay, importance, memory kind and recall history.
+                fts_score = max(
+                    0.0,
+                    min(10.0, (-raw_bm25) * 1_000_000.0),
+                )
+
+                score = fts_score + w + self._ranking_boost(row, query)
+                scored.append((score, row))
+
+        else:
+            for row in rows:
+                w = self._decay(row)
+                if w < min_weight:
+                    continue
+
+                hay = (
+                    str(row["text"]) + " "
+                    + str(row["kind"]) + " "
+                    + str(row["project"] or "") + " "
+                    + str(row["tags"])
+                ).lower()
+
+                fts_score = sum(
+                    2.0
+                    for word in str(query).lower().split()
+                    if len(word) >= 2 and word in hay
+                )
+
+                if fts_score <= 0:
+                    continue
+
+                score = fts_score + w + self._ranking_boost(row, query)
+                scored.append((score, row))
+
+        scored.sort(
+            key=lambda x: (x[0], x[1]["updated_at"]),
+            reverse=True,
+        )
+
         out = []
         for _, row in scored[:limit]:
             self.mark_recall(row["memory_id"])
             out.append(self._to_record(row))
+
         return out
 
     def by_kind(self, kind, limit=20, min_weight=DECAY_MIN_WEIGHT):
@@ -863,6 +1039,223 @@ class CognitiveEngine:
         self.tools = None; self.proactive = False
         self.motivations = list(self.DEFAULT_MOTIVATIONS)
 
+    def _semantic_extract(self, records):
+        """
+        Deterministically derive semantic roles from existing memories.
+
+        This never changes MemoryVault records or their kinds.
+        It only interprets existing durable information for ContextBus.
+        """
+        result = {
+            "project": [],
+            "goal": [],
+            "constraints": [],
+            "recent_work": [],
+        }
+
+        seen = {key: set() for key in result}
+
+        def add(group, text):
+            text = str(text).strip()
+            if not text:
+                return
+            key = text.lower()
+            if key not in seen[group]:
+                seen[group].add(key)
+                result[group].append(text)
+
+        project_words = (
+            "проект", "симбионт", "symbiont",
+        )
+
+        goal_patterns = (
+            "мне важно",
+            "я хочу",
+            "хочу, чтобы",
+            "нужно",
+            "цель",
+            "должен",
+            "должна",
+            "должно",
+        )
+
+        constraint_patterns = (
+            "не добавлять",
+            "не создавать",
+            "не менять",
+            "не публиковать",
+            "без новых",
+            "нельзя",
+            "не использовать",
+        )
+
+        work_patterns = (
+            "проверил",
+            "проверили",
+            "тест",
+            "тестировал",
+            "продолжил",
+            "начал работать",
+            "работаю над",
+            "сделал",
+            "создал",
+            "исследовал",
+            "эксперимент",
+            "перезапуск",
+        )
+
+        for record in records:
+            text = str(record.text).strip()
+            low = text.lower()
+
+            # Explicit persistent semantic kinds always win.
+            if record.kind == "project":
+                add("project", text)
+
+            if record.kind == "goal":
+                add("goal", text)
+
+            # Existing free-form memories can still carry project meaning.
+            if any(word in low for word in project_words):
+                add("project", text)
+
+            # Goal / intent extraction.
+            if any(pattern in low for pattern in goal_patterns):
+                add("goal", text)
+
+            # Architectural / operational constraints.
+            if any(pattern in low for pattern in constraint_patterns):
+                add("constraints", text)
+
+            # Recent work is evidence of the current workstream.
+            if any(pattern in low for pattern in work_patterns):
+                add("recent_work", text)
+
+        return result
+
+    def _build_semantic_context(self, request=None, memories=None):
+        """
+        Reconstruct the semantic state of the current work from persistent
+        Core sources and publish it into ContextBus.
+
+        ContextBus is only a derived runtime view.
+        MemoryVault / CognitiveState / AgentProfile remain authoritative.
+        """
+        memories = memories or []
+
+        # --- Identity -------------------------------------------------
+        identity = {}
+        if self.profile:
+            identity = {
+                "name": self.profile.name(),
+                "role": self.profile.role(),
+                "style": self.profile.style(),
+                "traits": self.profile.traits(),
+            }
+
+        # --- Persistent semantic groups ------------------------------
+        # Use retrieved memories as the durable source for semantic
+        # reconstruction. This is a derived runtime view only.
+        semantic_records = list(memories)
+
+        # Include important persistent memories so semantic extraction
+        # can recover project/goal/work meaning after a fresh process.
+        for record in self.memory.important(100):
+            if record.memory_id not in {m.memory_id for m in semantic_records}:
+                semantic_records.append(record)
+
+        semantic = self._semantic_extract(semantic_records)
+
+        project = list(semantic["project"])
+        goals = list(semantic["goal"])
+        open_loops = self.memory.open_loops(limit=8)
+        principles = self.memory.principles(limit=8)
+        preferences = self.memory.preferences(limit=8)
+
+        # Project-bearing memories are already supported by MemoryVault.
+        for m in self.memory.by_kind("project", limit=8):
+            project.append(m.text)
+
+        # Explicit goal memories, if present.
+        for m in self.memory.by_kind("goal", limit=8):
+            goals.append(m.text)
+
+        # --- Recent work ----------------------------------------------
+        recent_work = []
+        for m in self.memory.memories_today()[-8:]:
+            recent_work.append({
+                "kind": m.kind,
+                "text": m.text,
+            })
+
+        # --- Current cognitive state ----------------------------------
+        current_state = {}
+        if self.state:
+            current_state = dict(self.state.data)
+
+        # --- Constraints ----------------------------------------------
+        constraints = [
+            m.text
+            for m in principles
+            if any(
+                word in m.text.lower()
+                for word in (
+                    "не добавлять",
+                    "не создавать",
+                    "без новых",
+                    "нельзя",
+                    "не менять",
+                    "не публиковать",
+                )
+            )
+        ]
+
+        # --- Next step ------------------------------------------------
+        next_step = None
+        if open_loops:
+            next_step = open_loops[0].text
+
+        # If the current request is clearly a continuation request,
+        # preserve the strongest existing open loop rather than inventing
+        # a new objective.
+        if request:
+            low = str(request).lower()
+            continuation = any(
+                word in low
+                for word in (
+                    "продолж",
+                    "дальше",
+                    "следующ",
+                    "где останов",
+                    "с чего начать",
+                )
+            )
+            if continuation and open_loops:
+                next_step = open_loops[0].text
+
+        # If no explicit project memory exists, derive a lightweight
+        # project signal from retrieved memories without creating memory.
+        if not project:
+            for m in memories[:8]:
+                if m.project:
+                    project.append(m.project)
+
+        # --- Publish semantic snapshot --------------------------------
+        self.context.update(
+            identity=identity,
+            project=project,
+            goal=goals,
+            open_loops=[m.text for m in open_loops],
+            principles=[m.text for m in principles],
+            preferences=[m.text for m in preferences],
+            recent_work=recent_work,
+            current_state=current_state,
+            next_step=next_step,
+            constraints=constraints,
+        )
+
+        return self.context.snapshot()
+
     def connect_llm(self, provider): self.llm = provider
     def connect_tools(self, registry): self.tools = registry
 
@@ -923,36 +1316,158 @@ class CognitiveEngine:
     def decide(self, situation, options, use_tools=False):
         if not options:
             return {"decision": None, "reason": "нет вариантов"}
+
         text = str(situation).lower()
         s = self.state.data if self.state else {}
-        critical = any(x in text for x in ("опасность", "атака", "сбой", "критично", "угроза"))
+
+        critical = any(
+            x in text for x in ("опасность", "атака", "сбой", "критично", "угроза")
+        )
+
+        # Existing Core memory is the source of continuity.
+        open_loops = self.memory.open_loops(limit=5)
+        principles = self.memory.principles(limit=5)
+
+        loop_text = " ".join(str(m.text).lower() for m in open_loops)
+        principle_text = " ".join(str(m.text).lower() for m in principles)
+
+        continuation_terms = (
+            "продолж", "следующ", "эксперимент", "провер",
+            "восстанов", "cognitiveengine", "cognitive engine",
+            "существующ", "текущ", "лини"
+        )
+
+        restart_terms = (
+            "заново", "забыть", "сброс", "начать сначала",
+            "удалить", "новую задачу"
+        )
+
+        architecture_terms = (
+            "новый архитектурный слой",
+            "добавить архитектурный слой",
+            "новую архитектуру",
+            "новый слой",
+            "добавить слой"
+        )
+
         tool_hints = []
+
         if use_tools and self.tools:
             if any(x in text for x in ("память", "раньше", "история")):
                 r = self.tools.call("memory_search", query=situation[:60])
-                if r.get("ok"): tool_hints.append(f"memory:{len(r['result'])}")
+                if r.get("ok"):
+                    tool_hints.append(f"memory:{len(r['result'])}")
+
             if any(x in text for x in ("баланс", "деньги", "награда")):
                 r = self.tools.call("get_balance")
-                if r.get("ok"): tool_hints.append(f"balance:{r['result'].get('balance')}")
+                if r.get("ok"):
+                    tool_hints.append(
+                        f"balance:{r['result'].get('balance')}"
+                    )
+
         scored = []
+
         for i, opt in enumerate(options):
-            ot = str(opt).lower(); score = 0.0
-            if critical and any(x in ot for x in ("защитить", "исправить", "помочь", "безопасность")):
+            ot = str(opt).lower()
+            score = 0.0
+            reasons = []
+
+            # Existing safety logic.
+            if critical and any(
+                x in ot for x in ("защитить", "исправить", "помочь", "безопасность")
+            ):
                 score += 5.0 + s.get("caution", 0.5) * 1.5
-            if any(x in ot for x in ("игнорировать", "риск", "удалить", "отключить")):
+                reasons.append("безопасность")
+
+            if any(
+                x in ot for x in ("игнорировать", "риск", "удалить", "отключить")
+            ):
                 score -= 4.0 + s.get("stress", 0.0)
+                reasons.append("риск")
+
+            # Continuity: an existing open loop has priority over starting
+            # an unrelated line.
+            if open_loops:
+                if any(term in ot for term in continuation_terms):
+                    score += 6.0
+                    reasons.append("продолжение open_loop")
+
+                if any(term in ot for term in restart_terms):
+                    score -= 7.0
+                    reasons.append("разрыв текущей линии")
+
+            # Respect restored principles and constraints.
+            if principles:
+                if any(term in ot for term in architecture_terms):
+                    if any(
+                        x in principle_text
+                        for x in ("не добавлять", "не создавать", "без новых")
+                    ):
+                        score -= 8.0
+                        reasons.append("нарушение архитектурного ограничения")
+
+                if (
+                    "конкрет" in principle_text
+                    and any(term in ot for term in ("провер", "эксперимент"))
+                ):
+                    score += 3.0
+                    reasons.append("конкретный эксперимент")
+
+            # Explicitly prefer options related to the actual restored loop.
+            if loop_text:
+                loop_tokens = {
+                    w for w in self._words(loop_text)
+                    if len(w) >= 5
+                }
+                option_tokens = set(self._words(ot))
+                common = loop_tokens & option_tokens
+
+                if common:
+                    score += min(4.0, 0.8 * len(common))
+                    reasons.append("связь с восстановленной задачей")
+
             mots = " ".join(self.motivations).lower()
-            if "protect" in mots and "защит" in ot: score += 1.2
-            if "secure_resources" in mots and any(x in ot for x in ("заработок", "награда", "квест")):
+
+            if "protect" in mots and "защит" in ot:
+                score += 1.2
+
+            if "secure_resources" in mots and any(
+                x in ot for x in ("заработок", "награда", "квест")
+            ):
                 score += 1.5
+
             score += s.get("confidence", 0.5) * 0.6
-            scored.append((score, -i, opt))
-        scored.sort(reverse=True)
-        result = {"decision": scored[0][2],
-                  "reason": "безопасность, мотивации, экономика, автономия",
-                  "scores": [{"option": x[2], "score": round(x[0], 3)} for x in scored],
-                  "tool_hints": tool_hints, "time": now_iso()}
-        return result
+
+            scored.append(
+                {
+                    "option": opt,
+                    "score": round(score, 3),
+                    "reasons": reasons,
+                    "_index": i,
+                }
+            )
+
+        scored.sort(key=lambda x: (-x["score"], x["_index"]))
+
+        best = scored[0]
+
+        return {
+            "decision": best["option"],
+            "reason": (
+                "оценка текущего open_loop, принципов и ограничений "
+                "Core; затем безопасность и мотивации"
+            ),
+            "scores": [
+                {
+                    "option": x["option"],
+                    "score": x["score"],
+                    "reasons": x["reasons"],
+                }
+                for x in scored
+            ],
+            "tool_hints": tool_hints,
+            "time": now_iso(),
+        }
 
     def _state_guidance(self):
         if not self.state:
@@ -1007,13 +1522,31 @@ class CognitiveEngine:
         if self.state: self.state.adapt_from_text(request)
         memories = self.memory.search(request, limit=MAX_MEMORY_RESULTS)
         if not memories: memories = self.memory.important(5)
+
+        # Rebuild runtime semantic context from persistent memory.
+        self._build_semantic_context(
+            request=request,
+            memories=memories,
+        )
+
         self.recalculate_motivations()
         source = "local"; response = ""
-        if self.llm is not None and self.llm.is_available():
+
+        # First try deterministic local reasoning over restored memory.
+        local_reasoning = self._local_reasoning(request, memories)
+        if local_reasoning:
+            response = local_reasoning
+            source = "local_reasoning"
+
+        if not response and self.llm is not None and self.llm.is_available():
             ans = self.llm.chat(self._llm_messages(request, memories), timeout=90.0)
-            if ans: response = ans.strip(); source = self.llm.name
+            if ans:
+                response = ans.strip()
+                source = self.llm.name
+
         if not response:
-            response = self._local(request, memories); source = "local"
+            response = self._local(request, memories)
+            source = "local"
         self.memory.record_message("symbiont", response)
         self.journal.append("cognition.completed",
                             {"request_id": rid, "source": source, "proactive": self.proactive})
@@ -1049,8 +1582,143 @@ class CognitiveEngine:
             self.journal.append("cognition.proactive_message", {"text": ans[:300]})
         return ans
 
+    def _local_reasoning(self, request, memories):
+        """Локальный вывод с приоритетом самого нового релевантного состояния."""
+        if infer_rule_state is None or not memories:
+            return None
+
+        rules = [m for m in memories if str(m.kind).lower() == "principle"]
+        states = [m for m in memories if str(m.kind).lower() == "general"]
+
+        # Состояния рассматриваются от новых к старым.
+        states = sorted(
+            states,
+            key=lambda m: getattr(m, "created_at", ""),
+            reverse=True,
+        )
+
+        for rule in rules:
+            rule_subject = str(rule.text).lower()
+
+            # Сначала ищем самое новое состояние, относящееся к субъекту
+            # правила. Историческое состояние того же субъекта не может
+            # заменить более новое состояние.
+            rule_result = None
+
+            for state in states:
+                result = infer_rule_state(rule.text, state.text)
+
+                if result is not None:
+                    rule_result = result
+                    break
+
+                # Если состояние явно относится к субъекту правила, но
+                # правило сейчас не выполняется, это является текущим
+                # отрицательным состоянием. Старые состояния больше
+                # не рассматриваем.
+                state_text = str(state.text).lower()
+                subject = result.get("subject") if result else None
+
+                if subject:
+                    continue
+
+                # Для состояний без явного субъекта infer_rule_state()
+                # может вернуть None и при этом не позволить определить,
+                # относится ли состояние к правилу. Такие состояния не
+                # блокируют поиск.
+                if any(token in state_text for token in (
+                    "электричество",
+                    "заряд",
+                    "аккумулятор",
+                    "перегрев",
+                    "температура",
+                )):
+                    if (
+                        "электричеств" in rule_subject
+                        or "заряд" in rule_subject
+                        or "аккумулятор" in rule_subject
+                        or "перегрев" in rule_subject
+                        or "температур" in rule_subject
+                    ):
+                        break
+
+            if rule_result is None:
+                continue
+
+            subject = rule_result.get("subject", "объект")
+            condition = rule_result.get("condition", "")
+            consequence = rule_result.get("consequence", "")
+
+            answer = (
+                f"По сохранённому правилу для {subject}: "
+                f"условие выполнено ({condition}). "
+                f"Следствие: {consequence}."
+            )
+
+            self.journal.append(
+                "cognition.local_reasoning",
+                {
+                    "request": request,
+                    "subject": subject,
+                    "inference": rule_result,
+                    "llm_required": False,
+                },
+            )
+
+            return answer
+
+        return None
+
     def _local(self, request, memories):
         low = request.lower()
+        context = self.context.snapshot()
+
+        # Use the restored semantic context for continuation requests.
+        if any(w in low for w in (
+            "дальше", "продолж", "следующ", "где останов",
+            "с чего начать"
+        )):
+            next_step = context.get("next_step")
+            if next_step:
+                return f"Продолжаем: {next_step}"
+
+        # Report the currently restored unfinished work.
+        if any(w in low for w in (
+            "что осталось", "незаверш", "открыт", "что не законч"
+        )):
+            open_loops = context.get("open_loops") or []
+            if open_loops:
+                return "Открытые задачи:\n" + "\n".join(
+                    f"  • {item}" for item in open_loops[:5]
+                )
+
+        # Report restored project direction.
+        if any(w in low for w in (
+            "где останов", "что мы делаем", "над чем работаем",
+            "какой проект"
+        )):
+            project = context.get("project") or []
+            next_step = context.get("next_step")
+            parts = []
+            if project:
+                parts.append("Проект:\n" + "\n".join(
+                    f"  • {item}" for item in project[:5]
+                ))
+            if next_step:
+                parts.append(f"Следующий шаг: {next_step}")
+            if parts:
+                return "\n".join(parts)
+
+        # Report restored constraints/principles.
+        if any(w in low for w in (
+            "ограничен", "ограничения", "правил", "принцип"
+        )):
+            constraints = context.get("constraints") or []
+            if constraints:
+                return "Ограничения:\n" + "\n".join(
+                    f"  • {item}" for item in constraints[:5]
+                )
+
         if any(w in low.split() for w in ("что", "как", "почему", "зачем", "где", "когда", "кто")):
             identity = self.memory.recall_identity()
             if memories:
@@ -1170,10 +1838,11 @@ class MemorySyncEngine:
 # ============================================================
 
 class NightWorker:
-    def __init__(self, memory, mind, journal):
+    def __init__(self, memory, mind, journal, memory_v2=None):
         self.memory = memory
         self.mind = mind
         self.journal = journal
+        self.memory_v2 = memory_v2
 
     def run(self):
         today = datetime.now(timezone.utc).date().isoformat()
@@ -1181,10 +1850,76 @@ class NightWorker:
         if existing: return existing["text"]
         mems = self.memory.memories_today()
 
+        # Memory V2 reflection is candidate-only.
         # MemoryVault remains the source of truth.
         reflection_result = None
         consolidation_result = None
+        if self.memory_v2 is not None and self.memory_v2.enabled:
+            experiences = [
+                m.text
+                for m in mems
+                if getattr(m, "text", None)
+            ]
+            reflection_result = self.memory_v2.reflect(
+                experiences
+            )
+            consolidation_result = self.memory_v2.consolidate(
+                reflection_result
+            )
 
+        principles = self.memory.principles(5)
+        open_loops = self.memory.open_loops(8)
+        if not mems and not principles and not open_loops: return "Сегодня я ничего не запомнил."
+        diary = [f"• {m.text[:150]}" for m in mems if m.kind in ("dialog", "general", "experience")]
+        pat = self.mind.notice_words(limit=30, min_count=2)
+        pat_lines = [f"• «{w}» — {c}" for w, c in pat[:5]]
+        emo = self.mind.notice_emotions(limit=30)
+        emo_lines = [f"• {e} — {c}" for e, c in emo[:5]]
+        goals = []
+        for m in mems:
+            if m.kind not in ("dialog", "general", "experience"):
+                continue
+            if any(mk in m.text.lower() for mk in ("хочу", "надо", "должен", "планирую", "нужно")):
+                goals.append(f"• {m.text[:150]}")
+        parts = [f"Разбор дня {today}:", f"\nЗаписей: {len(mems)}"]
+        if principles:
+            parts.append("\nПринципы:"); parts.extend(f"• {m.text[:150]}" for m in principles)
+        if open_loops:
+            parts.append("\nОткрытые задачи:"); parts.extend(f"• {m.text[:150]}" for m in open_loops)
+        if diary: parts.append("\nЧто было:"); parts.extend(diary[:10])
+        if pat_lines: parts.append("\nПовторялось:"); parts.extend(pat_lines)
+        if emo_lines: parts.append("\nЭмоции:"); parts.extend(emo_lines)
+        if goals: parts.append("\nНезавершённое из сегодняшних записей:"); parts.extend(goals[:5])
+
+        if reflection_result is not None and reflection_result.candidates:
+            parts.append("\nReflection V2 — кандидаты понимания:")
+            for candidate in reflection_result.candidates[:5]:
+                method = candidate.metadata.get("method", "reflection")
+                parts.append(
+                    f"• [{method}] {candidate.content[:180]} "
+                    f"(confidence={candidate.confidence:.2f})"
+                )
+
+        if consolidation_result is not None and consolidation_result.accepted:
+            parts.append(
+                f"\nKnowledge V2 — принято кандидатов: "
+                f"{len(consolidation_result.accepted)}"
+            )
+
+        llm = self.mind.llm
+        if llm is not None and llm.is_available():
+            prompt = ("Ты — Symbiont. Разбор дня. Учитывай принципы и открытые задачи. "
+                      "Выдели важное, повторяющееся и следующий безопасный шаг. 5-7 предложений. "
+                      "Не выдавай предположение за факт.\n\n" + "\n".join(parts))
+            ans = llm.chat([{"role": "user", "content": prompt}], timeout=120.0)
+            if ans: parts.append("\nРазмышление:"); parts.append(ans.strip())
+        text = "\n".join(parts)
+        self.memory.save_night_report(today, text)
+        # Night worker turns explicit unresolved intent into durable open-loop memory.
+        for goal in goals[:5]:
+            clean = goal.lstrip("• ").strip()
+            if clean and not any(clean.lower() in m.text.lower() for m in open_loops):
+                self.memory.remember(clean, kind="open_loop", importance=7, source="night_worker", tags=["night", "open_loop"])
         return text
 
 
@@ -1271,6 +2006,42 @@ class P2PNetwork:
         self.node = node; self.udp_port = udp_port; self.tcp_port = tcp_port
         self.running = False
 
+        # Existing SCP-1 identity/security attached to P2P.
+        self.scp_identity = (
+            get_node_identity()
+            if get_node_identity is not None
+            else None
+        )
+
+        trusted_raw = os.getenv(
+            "SYMBIONT_SCP1_TRUSTED_NODES",
+            "",
+        )
+
+        trusted_nodes = [
+            item.strip()
+            for item in trusted_raw.split(",")
+            if item.strip()
+        ]
+
+        self.scp1 = (
+            get_scp1_zerotrust(
+                trusted_nodes=trusted_nodes
+            )
+            if get_scp1_zerotrust is not None
+            else None
+        )
+
+        # SCP-1 P2P transport remains opt-in for now.
+        self.scp1_enabled = (
+            os.getenv(
+                "SYMBIONT_SCP1_P2P",
+                "0",
+            )
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
 
     def start(self):
         self.running = True
@@ -1280,6 +2051,54 @@ class P2PNetwork:
 
     def stop(self): self.running = False
 
+    def _scp1_wrap(self, payload, message_type="P2P"):
+        if (
+            not self.scp1_enabled
+            or self.scp_identity is None
+            or SCP1 is None
+        ):
+            return None
+
+        packet = SCP1.build_payload(
+            node_id=self.scp_identity.node_id,
+            public_key=self.scp_identity.public_key,
+            payload=payload,
+            capability="network.send",
+            message_type=message_type,
+        )
+
+        packet = SCP1.sign(
+            self.scp_identity.private_key,
+            packet,
+        )
+
+        return {"scp1": packet}
+
+    def _scp1_unwrap(self, wire):
+        if (
+            not self.scp1_enabled
+            or self.scp1 is None
+            or SCP1 is None
+        ):
+            return None
+
+        if not isinstance(wire, dict):
+            return None
+
+        packet = wire.get("scp1")
+
+        if not isinstance(packet, dict):
+            return None
+
+        if not self.scp1.verify(packet):
+            return None
+
+        payload = packet.get("payload")
+
+        if not isinstance(payload, dict):
+            return None
+
+        return payload
 
     def _udp_beacon(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1354,7 +2173,21 @@ class P2PNetwork:
                 data.decode("utf-8")
             )
 
-            req = wire
+            # SCP-1 becomes the authenticated network envelope
+            # when explicitly enabled.
+            if self.scp1_enabled:
+                req = self._scp1_unwrap(wire)
+
+                if req is None:
+                    conn.sendall(
+                        canonical_json({
+                            "status": "UNAUTHORIZED",
+                            "reason": "scp1",
+                        }).encode()
+                    )
+                    return
+            else:
+                req = wire
 
             # Keep existing Core Identity verification for
             # compatibility with the current P2P protocol.
@@ -1374,6 +2207,14 @@ class P2PNetwork:
                     "status": "UNAUTHORIZED"
                 }
 
+                if self.scp1_enabled:
+                    wrapped = self._scp1_wrap(
+                        response,
+                        message_type="RESPONSE",
+                    )
+
+                    if wrapped is not None:
+                        response = wrapped
 
                 conn.sendall(
                     canonical_json(response).encode()
@@ -1384,6 +2225,61 @@ class P2PNetwork:
 
             if action == "QUEST_OFFER":
                 resp = self.node.quests.handle_incoming(req)
+
+            elif action == "QUEST_PAYMENT":
+                quest_id = req.get("quest_id")
+                creator = req.get("creator")
+                worker = req.get("worker")
+                reward = req.get("reward")
+                currency = req.get("currency", CURRENCY)
+
+                if not quest_id:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "missing_quest_id",
+                    }
+
+                elif not creator or creator != sender:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "creator_sender_mismatch",
+                    }
+
+                elif not worker or worker != self.node.identity.id():
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "worker_mismatch",
+                    }
+
+                elif currency != CURRENCY:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "currency_mismatch",
+                    }
+
+                else:
+                    accepted = self.node.economy.receive_quest_payment(
+                        quest_id=quest_id,
+                        amount=reward,
+                        creator_node=creator,
+                        worker_node=worker,
+                        currency=currency,
+                    )
+
+                    if accepted:
+                        resp = {
+                            "status": "PAYMENT_RECEIVED",
+                            "quest_id": quest_id,
+                            "worker": worker,
+                            "amount": float(reward),
+                            "currency": currency,
+                        }
+                    else:
+                        resp = {
+                            "status": "PAYMENT_REJECTED",
+                            "reason": "economy_rejected",
+                            "quest_id": quest_id,
+                        }
 
             elif action == "PING":
                 resp = {
@@ -1396,6 +2292,14 @@ class P2PNetwork:
                     "status": "UNKNOWN"
                 }
 
+            if self.scp1_enabled:
+                wrapped = self._scp1_wrap(
+                    resp,
+                    message_type="RESPONSE",
+                )
+
+                if wrapped is not None:
+                    resp = wrapped
 
             conn.sendall(
                 canonical_json(resp).encode()
@@ -1431,7 +2335,20 @@ class P2PNetwork:
                 (peer.address, peer.tcp_port)
             )
 
-            wire = packet
+            if self.scp1_enabled:
+                wire = self._scp1_wrap(
+                    packet,
+                    message_type=packet.get(
+                        "action",
+                        "P2P",
+                    ),
+                )
+
+                if wire is None:
+                    s.close()
+                    return None
+            else:
+                wire = packet
 
             s.sendall(
                 canonical_json(wire).encode("utf-8")
@@ -1444,6 +2361,8 @@ class P2PNetwork:
                 data.decode("utf-8")
             )
 
+            if self.scp1_enabled:
+                return self._scp1_unwrap(response)
 
             return response
 
@@ -1584,7 +2503,7 @@ class Wallet:
 class Economy:
     def __init__(self, path, journal):
         self.path = path; self.journal = journal; self.lock = threading.RLock()
-        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self._load()
+        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self._load()
 
     def _load(self):
         if not self.path.exists(): return
@@ -1593,7 +2512,7 @@ class Economy:
             self.wallet = Wallet(float(w.get("balance", 0)),
                                  float(w.get("lifetime_received", 0)),
                                  float(w.get("lifetime_spent", 0)))
-            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {})
+            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {}); self.payments = data.get("payments", {})
         except Exception: pass
 
     def _save(self):
@@ -1601,7 +2520,8 @@ class Economy:
             "wallet": asdict(self.wallet),
             "last_food_allocation": self.last_food,
             "currency": CURRENCY,
-            "escrow": self.escrow}, ensure_ascii=False, indent=2))
+            "escrow": self.escrow,
+            "payments": self.payments}, ensure_ascii=False, indent=2))
 
     def credit(self, amount, reason):
         amount = float(amount)
@@ -1672,6 +2592,40 @@ class Economy:
             self.journal.append("economy.escrow_reserved", tx)
 
             return True
+
+    def finalize_quest_payment(self, quest_id, worker_node=""):
+        """Finalize an already-paid quest without refunding the creator."""
+        quest_id = str(quest_id)
+
+        with self.lock:
+            tx = self.escrow.get(quest_id)
+            if not tx:
+                return False
+
+            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+                return False
+
+            reward = float(tx.get("reward", 0))
+            if reward <= 0:
+                return False
+
+            tx["worker_node"] = worker_node or tx.get("worker_node", "")
+            tx["status"] = "RELEASED"
+            tx["escrow_state"] = "RELEASED"
+            tx["released_at"] = now_iso()
+            tx["payment_finalized"] = True
+
+            self._save()
+            self.journal.append(
+                "economy.escrow_payment_finalized",
+                {
+                    "quest_id": quest_id,
+                    "reward": reward,
+                    "worker_node": tx.get("worker_node", ""),
+                },
+            )
+
+            return reward
 
     def release_quest(self, quest_id, worker_node=""):
         quest_id = str(quest_id)
@@ -1772,6 +2726,64 @@ class Economy:
         self.credit(reward, f"Quest reward #{quest_id}")
         return self.wallet.balance
 
+    def receive_quest_payment(
+        self,
+        quest_id,
+        amount,
+        creator_node="",
+        worker_node="",
+        currency=None,
+    ):
+        """Receive a quest payment exactly once."""
+        with self.lock:
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                return False
+
+            if amount <= 0:
+                return False
+
+            if not quest_id:
+                return False
+
+            if currency is None:
+                currency = CURRENCY
+
+            if currency != CURRENCY:
+                return False
+
+            if quest_id in self.payments:
+                return False
+
+            receipt = {
+                "quest_id": quest_id,
+                "creator_node": creator_node,
+                "worker_node": worker_node,
+                "amount": amount,
+                "currency": currency,
+                "received_at": datetime.utcnow().isoformat() + "Z",
+            }
+
+            self.wallet.balance += amount
+            self.wallet.lifetime_received += amount
+            self.payments[quest_id] = receipt
+
+            self._save()
+
+            self.journal.append(
+                "economy.payment_received",
+                {
+                    "quest_id": quest_id,
+                    "creator_node": creator_node,
+                    "worker_node": worker_node,
+                    "amount": amount,
+                    "currency": currency,
+                },
+            )
+
+            return True
+
     def snapshot(self):
         with self.lock:
             return {"currency": CURRENCY, "balance": round(self.wallet.balance, 2),
@@ -1831,15 +2843,98 @@ class PermissionGate:
 # ============================================================
 
 class ContextBus:
+    """
+    Runtime semantic context.
+
+    ContextBus is NOT a second memory store.
+    MemoryVault remains the source of truth.
+
+    The bus holds a derived semantic snapshot of the current work:
+        identity
+        project
+        goal
+        open_loops
+        principles
+        preferences
+        recent_work
+        current_state
+        next_step
+        constraints
+
+    This allows a fresh Symbiont process to reconstruct meaning from
+    persistent memory without requiring an LLM.
+    """
+
+    GROUPS = (
+        "identity",
+        "project",
+        "goal",
+        "open_loops",
+        "principles",
+        "preferences",
+        "recent_work",
+        "current_state",
+        "next_step",
+        "constraints",
+    )
+
     def __init__(self):
-        self.lock = threading.RLock(); self.data = {}
+        self.lock = threading.RLock()
+        self.data = {}
 
     def update(self, **kwargs):
-        with self.lock: self.data.update(kwargs)
-        return self.data
+        with self.lock:
+            for key, value in kwargs.items():
+                self.data[key] = value
+        return self.snapshot()
+
+    def set_group(self, name, value):
+        name = str(name).strip().lower()
+        if name not in self.GROUPS:
+            raise ValueError(
+                f"Unknown semantic group: {name}. "
+                f"Allowed: {', '.join(self.GROUPS)}"
+            )
+        with self.lock:
+            self.data[name] = value
+        return value
+
+    def get_group(self, name, default=None):
+        with self.lock:
+            return self.data.get(str(name).strip().lower(), default)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                key: value
+                for key, value in self.data.items()
+            }
 
     def get(self):
-        with self.lock: return dict(self.data) if self.data else None
+        return self.snapshot() if self.data else None
+
+    def clear(self):
+        with self.lock:
+            self.data.clear()
+
+    def has(self, name):
+        with self.lock:
+            return str(name).strip().lower() in self.data
+
+    def missing(self):
+        with self.lock:
+            return [
+                name for name in self.GROUPS
+                if name not in self.data
+            ]
+
+    def summary(self):
+        with self.lock:
+            return {
+                "groups": list(self.data.keys()),
+                "complete": not self.missing(),
+                "missing": self.missing(),
+            }
 
 
 # ============================================================
@@ -1871,12 +2966,35 @@ class Symbiont:
         self.bodies = Bodies(self.root / "bodies.json")
         self.memory = MemoryVault(self.root / "memory.sqlite3", self.journal)
 
+        # Memory Integrity: read-only контроль целостности MemoryVault.
+        # MemoryVault остаётся источником истины.
+        self.memory_integrity = None
+        if MemoryIntegrity is not None:
+            self.memory_integrity = MemoryIntegrity(
+                self.memory,
+                self.root / "memory.integrity.json",
+            )
+
+        # Memory V2: shadow-контур ассоциаций/рефлексии.
+        # MemoryVault остаётся источником истины.
+        self.memory_v2 = None
+        if MemoryV2Runtime is not None:
+            self.memory_v2 = MemoryV2Runtime(
+                self.memory,
+                enabled=None,
+                shadow=True,
+            )
 
         self.context = ContextBus()
         self.mind = CognitiveEngine(self.memory, self.context, self.journal)
         self.mind.profile = self.profile
         self.mind.state = self.state
-        self.night_worker = NightWorker(self.memory, self.mind, self.journal)
+
+        # Restore derived semantic context from persistent Core sources.
+        # ContextBus remains a runtime view; MemoryVault remains authoritative.
+        self.mind._build_semantic_context()
+
+        self.night_worker = NightWorker(self.memory, self.mind, self.journal, self.memory_v2)
         self.listener = AmbientListener(self.mind, self.memory, self.journal)
         self.economy = Economy(self.root / "state.json", self.journal)
 
@@ -1893,7 +3011,9 @@ class Symbiont:
             in {"1", "true", "yes", "on"}
         ):
             try:
-                self.smsa = SMSA()
+                self.smsa = SMSA(
+                    self.root / "security_policy.json"
+                )
                 self.permissions.add_listener(
                     self._sync_permission_to_smsa
                 )
@@ -1926,6 +3046,7 @@ class Symbiont:
         self.mind.connect_tools(self.tools)
         self.sync_engine = MemorySyncEngine(self)
         self.llm_provider = None
+        self._load_llm_config()
         self.started_at = now_iso()
         self.journal.append("symbiont.initialized",
                             {"version": CORE_VERSION, "id": self.identity.id()})
@@ -1967,15 +3088,61 @@ class Symbiont:
             self._sync_permission_to_smsa(core_cap, value)
 
 
-    def llm_enable(self, *args, **kwargs):
-        return False, "LLM удалён из этой сборки."
+    def _save_llm_config(self, provider, url="", model=""):
+        atomic_write(self.root / "llm.json",
+                     json.dumps({"provider": provider, "url": url, "model": model},
+                                ensure_ascii=False, indent=2))
+
+    def _load_llm_config(self):
+        cfg = self.root / "llm.json"
+        if not cfg.exists():
+            return
+        try:
+            d = json.loads(cfg.read_text(encoding="utf-8"))
+            provider = d.get("provider", "")
+            url = d.get("url", DEFAULT_LLM_URL)
+            model = d.get("model", DEFAULT_LLM_MODEL)
+            if provider == "openai":
+                self.llm_provider = OpenAIProvider(url=url, model=model)
+                self.mind.connect_llm(self.llm_provider)
+            elif provider == "ollama":
+                self.llm_provider = OllamaProvider(url=url, model=model)
+                self.mind.connect_llm(self.llm_provider)
+        except Exception:
+            pass
+
+    def llm_enable(self, url=DEFAULT_LLM_URL, model=DEFAULT_LLM_MODEL):
+        if OpenAIProvider is not None:
+            p = OpenAIProvider(url=url, model=model)
+            if p.is_available():
+                self.llm_provider = p
+                self.mind.connect_llm(p)
+                self._save_llm_config("openai", url, model)
+                return True, f"LLM: {url} / {model}"
+        p = OllamaProvider(url=url, model=model)
+        if not p.is_available():
+            return False, f"LLM недоступен по {url}"
+        self.llm_provider = p
+        self.mind.connect_llm(p)
+        self._save_llm_config("ollama", url, model)
+        return True, f"Ollama: {url} / {model}"
+
 
     def llm_disable(self):
         self.llm_provider = None
         self.mind.connect_llm(None)
+        self._save_llm_config("none")
 
     def llm_status(self):
-        return {"enabled": False, "removed": True}
+        if self.llm_provider is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "name": self.llm_provider.name,
+            "available": self.llm_provider.is_available(),
+            "url": getattr(self.llm_provider, "url", "?"),
+            "model": getattr(self.llm_provider, "model", "?"),
+        }
 
     def speak(self, text): return self.mind.think(text)
 
@@ -2179,8 +3346,19 @@ class Shell:
             print("listen on | listen off"); return True
 
         if cmd == "llm":
-            print("LLM удалён из этой сборки.")
-            return True
+            a = arg.strip().lower()
+            if not a or a == "status":
+                print(json.dumps(self.sym.llm_status(), ensure_ascii=False, indent=2)); return True
+            if a.startswith("on"):
+                parts = arg.split()
+                url = parts[1] if len(parts) > 1 else DEFAULT_LLM_URL
+                model = parts[2] if len(parts) > 2 else DEFAULT_LLM_MODEL
+                ok, msg = self.sym.llm_enable(url=url, model=model); print(msg); return True
+            if a == "off": self.sym.llm_disable(); print("LLM отключён."); return True
+            if a == "models":
+                if self.sym.llm_provider is None: print("LLM не подключён."); return True
+                m = self.sym.llm_provider.list_models(); print("Модели:", m if m else "(нет)"); return True
+            print("llm [status|on <url> <model>|off|models]"); return True
 
         if cmd in ("name", "имя"):
             if not arg: print(f"Имя: {self.sym.profile.name()}"); return True
