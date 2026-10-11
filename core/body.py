@@ -47,7 +47,59 @@ class NullBody(Body):
 
 
 
+class AndroidBody(Body):
+    """Body, подключающий существующий мост Termux:API."""
+    name = "android"
+
+    def __init__(self, bridge=None):
+        if bridge is None:
+            from . import android_bridge as bridge
+        self._bridge = bridge
+
+    def is_available(self):
+        return bool(self._bridge.is_available())
+
+    def speak(self, text):
+        return self._bridge.speak(text)
+
+    def listen(self, timeout=15):
+        return self._bridge.listen(timeout=timeout)
+
+    def battery(self):
+        return self._bridge.battery()
+
+    def notify(self, title, content):
+        return self._bridge.notify(title, content)
+
+    def sensor(self, name="accelerometer"):
+        return self._bridge.sensor(name)
+
+    def location(self):
+        return self._bridge.location()
+
+    def vibrate(self, ms=200):
+        return self._bridge.vibrate(ms)
+
+
 def get_body(force=None):
+    """Выбирает Android Body или безопасную NullBody."""
+    requested = str(
+        force or os.environ.get("SYMBIONT_BODY", "auto")
+    ).strip().lower()
+
+    if requested in {"null", "none", "off"}:
+        return NullBody()
+    if requested == "android":
+        return AndroidBody()
+    if requested not in {"", "auto"}:
+        return NullBody()
+
+    try:
+        android = AndroidBody()
+        if android.is_available():
+            return android
+    except Exception:
+        pass
     return NullBody()
 
 # ============================================================

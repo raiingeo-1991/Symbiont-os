@@ -334,9 +334,9 @@ class OwnerPolicy:
 
 
 class SecurePolicy:
-    def __init__(self):
+    def __init__(self, path=None):
         self.gate = CapabilityGate()
-        self.owner = OwnerPolicy()
+        self.owner = OwnerPolicy(path) if path is not None else OwnerPolicy()
 
         for capability, value in self.owner.snapshot().items():
             if value:
@@ -579,9 +579,13 @@ def get_module_registry(security=None):
 class SMSA:
     VERSION = "SMSA/1.0"
 
-    def __init__(self):
+    def __init__(self, policy_path=None):
         self.security = get_security()
-        self.policy = SecurePolicy()
+        self.policy = (
+            SecurePolicy(policy_path)
+            if policy_path is not None
+            else SecurePolicy()
+        )
 
         # SMSA policy and SecurityManager must use the same
         # capability gate. This keeps SecureSettlement,
