@@ -144,17 +144,37 @@ def parse_rule(rule):
 # ============================================================
 
 def extract_subject(state):
-    text = state.lower().replace("ё", "е")
+    text = str(state).lower().replace("ё", "е")
+    invalid_names = {"составляет", "равен", "равна", "равно"}
 
+    # Прямая привязка: «устройство Альфа» или «сервер Альфа».
     match = re.search(
-        r"\b(сервер|устройство)\s+([а-яa-z0-9_-]+)",
+        r"\b(сервер|устройств[оаеуом]+)\s+([а-яa-z0-9_-]+)\b",
         text,
     )
+    if match:
+        name = match.group(2)
+        if name not in invalid_names:
+            kind = "сервер" if match.group(1) == "сервер" else "устройство"
+            return f"{kind} {name}"
 
+    # Косвенная привязка: «аккумулятора Альфы» -> «устройство альфа».
+    match = re.search(
+        r"\bаккумулятор\w*\s+([а-яa-z0-9_-]+)\b",
+        text,
+    )
     if not match:
         return None
 
-    return f"{match.group(1)} {match.group(2)}"
+    name = match.group(1)
+    if name in invalid_names:
+        return None
+    if name.endswith("ы") and len(name) > 2:
+        name = name[:-1] + "а"
+    elif name.endswith("и") and len(name) > 2:
+        name = name[:-1] + "я"
+
+    return f"устройство {name}"
 
 
 def extract_current_percent(state):
@@ -346,9 +366,9 @@ def infer(rule, state):
     if parsed["type"] == "numeric":
         state_subject = extract_subject(state)
 
-        if state_subject is not None:
-            if state_subject != parsed["subject"]:
-                return None
+        # Без явно определённого совпадающего субъекта вывод запрещён.
+        if state_subject is None or state_subject != parsed["subject"]:
+            return None
 
     # --------------------------------------------------------
     # NUMERIC
@@ -413,69 +433,70 @@ def infer(rule, state):
 # ============================================================
 # TESTS
 # ============================================================
+if __name__ == "__main__":
 
-cases = [
+    cases = [
 
-    (
-        "TEXT / Бета",
-        "при отключении электричества сервер Бета прекращает работу.",
-        "сейчас электричество в здании отключено.",
-        True,
-    ),
+        (
+            "TEXT / Бета",
+            "при отключении электричества сервер Бета прекращает работу.",
+            "сейчас электричество в здании отключено.",
+            True,
+        ),
 
-    (
-        "TEXT / Бета / false",
-        "при отключении электричества сервер Бета прекращает работу.",
-        "сейчас электричество в здании включено.",
-        False,
-    ),
+        (
+            "TEXT / Бета / false",
+            "при отключении электричества сервер Бета прекращает работу.",
+            "сейчас электричество в здании включено.",
+            False,
+        ),
 
-    (
-        "NUMERIC / Альфа",
-        "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
-        "текущий заряд аккумулятора Альфы составляет 7 процентов.",
-        True,
-    ),
+        (
+            "NUMERIC / Альфа",
+            "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
+            "текущий заряд аккумулятора Альфы составляет 7 процентов.",
+            True,
+        ),
 
-    (
-        "NUMERIC / Альфа / false",
-        "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
-        "текущий заряд аккумулятора Альфы составляет 12 процентов.",
-        False,
-    ),
+        (
+            "NUMERIC / Альфа / false",
+            "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
+            "текущий заряд аккумулятора Альфы составляет 12 процентов.",
+            False,
+        ),
 
-    (
-        "NUMERIC / boundary",
-        "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
-        "текущий заряд аккумулятора Альфы составляет 10 процентов.",
-        False,
-    ),
+        (
+            "NUMERIC / boundary",
+            "когда заряд аккумулятора Альфы опускается ниже 10 процентов, устройство Альфа отключается.",
+            "текущий заряд аккумулятора Альфы составляет 10 процентов.",
+            False,
+        ),
 
-    (
-        "UNRELATED",
-        "при перегреве сервер Бета прекращает работу.",
-        "сейчас электричество в здании отключено.",
-        False,
-    ),
-]
-
-
-passed = 0
-
-for name, rule, state, expected in cases:
-    result = infer(rule, state)
-    ok = (result is not None) == expected
-
-    print(f"\n=== {name} ===")
-    print("RULE :", rule)
-    print("STATE:", state)
-    print("RESULT:", result)
-    print("EXPECTED:", expected)
-    print("PASS:", ok)
-
-    if ok:
-        passed += 1
+        (
+            "UNRELATED",
+            "при перегреве сервер Бета прекращает работу.",
+            "сейчас электричество в здании отключено.",
+            False,
+        ),
+    ]
 
 
-print("\n=== SUMMARY ===")
-print(f"{passed}/{len(cases)} passed")
+    passed = 0
+
+    for name, rule, state, expected in cases:
+        result = infer(rule, state)
+        ok = (result is not None) == expected
+
+        print(f"\n=== {name} ===")
+        print("RULE :", rule)
+        print("STATE:", state)
+        print("RESULT:", result)
+        print("EXPECTED:", expected)
+        print("PASS:", ok)
+
+        if ok:
+            passed += 1
+
+
+    print("\n=== SUMMARY ===")
+    print(f"{passed}/{len(cases)} passed")

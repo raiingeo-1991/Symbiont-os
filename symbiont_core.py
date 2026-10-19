@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
-    from local_reasoning_adapter import infer_rule_state
+    from local_reasoning_adapter import infer_rule_state, rule_subject, state_subject
 except Exception:
     infer_rule_state = None
 
@@ -50,13 +50,26 @@ except Exception:
     MemoryIntegrity = None
 
 try:
-    from core.node_identity import get_node_identity
+    from core.node_identity import NodeIdentity, get_node_identity
+except Exception:
+    NodeIdentity = None
+    get_node_identity = None
+
+try:
     from core.crypto_protocol import SCP1
+except Exception:
+    SCP1 = None
+
+try:
     from core.scp1_zerotrust import get_scp1_zerotrust
 except Exception:
-    get_node_identity = None
-    SCP1 = None
     get_scp1_zerotrust = None
+
+try:
+    from tsk import TrustedSecurityKernel, TSKError
+except Exception:
+    TrustedSecurityKernel = None
+    TSKError = Exception
 
 SMSA_PERMISSION_MAP = {
     "microphone": "microphone.listen",
@@ -207,10 +220,21 @@ class EventJournal:
         self._listeners = []
         self._last_event_hash = self._last_hash()
 
-    def add_listener(self, listener):
-        """Register a non-blocking observer for new journal events."""
+    def add_listener(self, listener, replay_existing=False):
+        """Register an observer, optionally replaying history atomically."""
         with self.lock:
-            self._listeners.append(listener)
+            if replay_existing:
+                valid, _ = self.verify()
+                if not valid:
+                    raise ValueError(
+                        "Core EventJournal integrity check failed; "
+                        "refusing replay"
+                    )
+                for event in self.all_events():
+                    listener(event)
+
+            if listener not in self._listeners:
+                self._listeners.append(listener)
 
     def _last_hash(self):
         if not self.path.exists(): return "0" * 64
@@ -1039,6 +1063,223 @@ class CognitiveEngine:
         self.tools = None; self.proactive = False
         self.motivations = list(self.DEFAULT_MOTIVATIONS)
 
+    def _semantic_extract(self, records):
+        """
+        Deterministically derive semantic roles from existing memories.
+
+        This never changes MemoryVault records or their kinds.
+        It only interprets existing durable information for ContextBus.
+        """
+        result = {
+            "project": [],
+            "goal": [],
+            "constraints": [],
+            "recent_work": [],
+        }
+
+        seen = {key: set() for key in result}
+
+        def add(group, text):
+            text = str(text).strip()
+            if not text:
+                return
+            key = text.lower()
+            if key not in seen[group]:
+                seen[group].add(key)
+                result[group].append(text)
+
+        project_words = (
+            "проект", "симбионт", "symbiont",
+        )
+
+        goal_patterns = (
+            "мне важно",
+            "я хочу",
+            "хочу, чтобы",
+            "нужно",
+            "цель",
+            "должен",
+            "должна",
+            "должно",
+        )
+
+        constraint_patterns = (
+            "не добавлять",
+            "не создавать",
+            "не менять",
+            "не публиковать",
+            "без новых",
+            "нельзя",
+            "не использовать",
+        )
+
+        work_patterns = (
+            "проверил",
+            "проверили",
+            "тест",
+            "тестировал",
+            "продолжил",
+            "начал работать",
+            "работаю над",
+            "сделал",
+            "создал",
+            "исследовал",
+            "эксперимент",
+            "перезапуск",
+        )
+
+        for record in records:
+            text = str(record.text).strip()
+            low = text.lower()
+
+            # Explicit persistent semantic kinds always win.
+            if record.kind == "project":
+                add("project", text)
+
+            if record.kind == "goal":
+                add("goal", text)
+
+            # Existing free-form memories can still carry project meaning.
+            if any(word in low for word in project_words):
+                add("project", text)
+
+            # Goal / intent extraction.
+            if any(pattern in low for pattern in goal_patterns):
+                add("goal", text)
+
+            # Architectural / operational constraints.
+            if any(pattern in low for pattern in constraint_patterns):
+                add("constraints", text)
+
+            # Recent work is evidence of the current workstream.
+            if any(pattern in low for pattern in work_patterns):
+                add("recent_work", text)
+
+        return result
+
+    def _build_semantic_context(self, request=None, memories=None):
+        """
+        Reconstruct the semantic state of the current work from persistent
+        Core sources and publish it into ContextBus.
+
+        ContextBus is only a derived runtime view.
+        MemoryVault / CognitiveState / AgentProfile remain authoritative.
+        """
+        memories = memories or []
+
+        # --- Identity -------------------------------------------------
+        identity = {}
+        if self.profile:
+            identity = {
+                "name": self.profile.name(),
+                "role": self.profile.role(),
+                "style": self.profile.style(),
+                "traits": self.profile.traits(),
+            }
+
+        # --- Persistent semantic groups ------------------------------
+        # Use retrieved memories as the durable source for semantic
+        # reconstruction. This is a derived runtime view only.
+        semantic_records = list(memories)
+
+        # Include important persistent memories so semantic extraction
+        # can recover project/goal/work meaning after a fresh process.
+        for record in self.memory.important(100):
+            if record.memory_id not in {m.memory_id for m in semantic_records}:
+                semantic_records.append(record)
+
+        semantic = self._semantic_extract(semantic_records)
+
+        project = list(semantic["project"])
+        goals = list(semantic["goal"])
+        open_loops = self.memory.open_loops(limit=8)
+        principles = self.memory.principles(limit=8)
+        preferences = self.memory.preferences(limit=8)
+
+        # Project-bearing memories are already supported by MemoryVault.
+        for m in self.memory.by_kind("project", limit=8):
+            project.append(m.text)
+
+        # Explicit goal memories, if present.
+        for m in self.memory.by_kind("goal", limit=8):
+            goals.append(m.text)
+
+        # --- Recent work ----------------------------------------------
+        recent_work = []
+        for m in self.memory.memories_today()[-8:]:
+            recent_work.append({
+                "kind": m.kind,
+                "text": m.text,
+            })
+
+        # --- Current cognitive state ----------------------------------
+        current_state = {}
+        if self.state:
+            current_state = dict(self.state.data)
+
+        # --- Constraints ----------------------------------------------
+        constraints = [
+            m.text
+            for m in principles
+            if any(
+                word in m.text.lower()
+                for word in (
+                    "не добавлять",
+                    "не создавать",
+                    "без новых",
+                    "нельзя",
+                    "не менять",
+                    "не публиковать",
+                )
+            )
+        ]
+
+        # --- Next step ------------------------------------------------
+        next_step = None
+        if open_loops:
+            next_step = open_loops[0].text
+
+        # If the current request is clearly a continuation request,
+        # preserve the strongest existing open loop rather than inventing
+        # a new objective.
+        if request:
+            low = str(request).lower()
+            continuation = any(
+                word in low
+                for word in (
+                    "продолж",
+                    "дальше",
+                    "следующ",
+                    "где останов",
+                    "с чего начать",
+                )
+            )
+            if continuation and open_loops:
+                next_step = open_loops[0].text
+
+        # If no explicit project memory exists, derive a lightweight
+        # project signal from retrieved memories without creating memory.
+        if not project:
+            for m in memories[:8]:
+                if m.project:
+                    project.append(m.project)
+
+        # --- Publish semantic snapshot --------------------------------
+        self.context.update(
+            identity=identity,
+            project=project,
+            goal=goals,
+            open_loops=[m.text for m in open_loops],
+            principles=[m.text for m in principles],
+            preferences=[m.text for m in preferences],
+            recent_work=recent_work,
+            current_state=current_state,
+            next_step=next_step,
+            constraints=constraints,
+        )
+
+        return self.context.snapshot()
+
     def connect_llm(self, provider): self.llm = provider
     def connect_tools(self, registry): self.tools = registry
 
@@ -1099,36 +1340,158 @@ class CognitiveEngine:
     def decide(self, situation, options, use_tools=False):
         if not options:
             return {"decision": None, "reason": "нет вариантов"}
+
         text = str(situation).lower()
         s = self.state.data if self.state else {}
-        critical = any(x in text for x in ("опасность", "атака", "сбой", "критично", "угроза"))
+
+        critical = any(
+            x in text for x in ("опасность", "атака", "сбой", "критично", "угроза")
+        )
+
+        # Existing Core memory is the source of continuity.
+        open_loops = self.memory.open_loops(limit=5)
+        principles = self.memory.principles(limit=5)
+
+        loop_text = " ".join(str(m.text).lower() for m in open_loops)
+        principle_text = " ".join(str(m.text).lower() for m in principles)
+
+        continuation_terms = (
+            "продолж", "следующ", "эксперимент", "провер",
+            "восстанов", "cognitiveengine", "cognitive engine",
+            "существующ", "текущ", "лини"
+        )
+
+        restart_terms = (
+            "заново", "забыть", "сброс", "начать сначала",
+            "удалить", "новую задачу"
+        )
+
+        architecture_terms = (
+            "новый архитектурный слой",
+            "добавить архитектурный слой",
+            "новую архитектуру",
+            "новый слой",
+            "добавить слой"
+        )
+
         tool_hints = []
+
         if use_tools and self.tools:
             if any(x in text for x in ("память", "раньше", "история")):
                 r = self.tools.call("memory_search", query=situation[:60])
-                if r.get("ok"): tool_hints.append(f"memory:{len(r['result'])}")
+                if r.get("ok"):
+                    tool_hints.append(f"memory:{len(r['result'])}")
+
             if any(x in text for x in ("баланс", "деньги", "награда")):
                 r = self.tools.call("get_balance")
-                if r.get("ok"): tool_hints.append(f"balance:{r['result'].get('balance')}")
+                if r.get("ok"):
+                    tool_hints.append(
+                        f"balance:{r['result'].get('balance')}"
+                    )
+
         scored = []
+
         for i, opt in enumerate(options):
-            ot = str(opt).lower(); score = 0.0
-            if critical and any(x in ot for x in ("защитить", "исправить", "помочь", "безопасность")):
+            ot = str(opt).lower()
+            score = 0.0
+            reasons = []
+
+            # Existing safety logic.
+            if critical and any(
+                x in ot for x in ("защитить", "исправить", "помочь", "безопасность")
+            ):
                 score += 5.0 + s.get("caution", 0.5) * 1.5
-            if any(x in ot for x in ("игнорировать", "риск", "удалить", "отключить")):
+                reasons.append("безопасность")
+
+            if any(
+                x in ot for x in ("игнорировать", "риск", "удалить", "отключить")
+            ):
                 score -= 4.0 + s.get("stress", 0.0)
+                reasons.append("риск")
+
+            # Continuity: an existing open loop has priority over starting
+            # an unrelated line.
+            if open_loops:
+                if any(term in ot for term in continuation_terms):
+                    score += 6.0
+                    reasons.append("продолжение open_loop")
+
+                if any(term in ot for term in restart_terms):
+                    score -= 7.0
+                    reasons.append("разрыв текущей линии")
+
+            # Respect restored principles and constraints.
+            if principles:
+                if any(term in ot for term in architecture_terms):
+                    if any(
+                        x in principle_text
+                        for x in ("не добавлять", "не создавать", "без новых")
+                    ):
+                        score -= 8.0
+                        reasons.append("нарушение архитектурного ограничения")
+
+                if (
+                    "конкрет" in principle_text
+                    and any(term in ot for term in ("провер", "эксперимент"))
+                ):
+                    score += 3.0
+                    reasons.append("конкретный эксперимент")
+
+            # Explicitly prefer options related to the actual restored loop.
+            if loop_text:
+                loop_tokens = {
+                    w for w in self._words(loop_text)
+                    if len(w) >= 5
+                }
+                option_tokens = set(self._words(ot))
+                common = loop_tokens & option_tokens
+
+                if common:
+                    score += min(4.0, 0.8 * len(common))
+                    reasons.append("связь с восстановленной задачей")
+
             mots = " ".join(self.motivations).lower()
-            if "protect" in mots and "защит" in ot: score += 1.2
-            if "secure_resources" in mots and any(x in ot for x in ("заработок", "награда", "квест")):
+
+            if "protect" in mots and "защит" in ot:
+                score += 1.2
+
+            if "secure_resources" in mots and any(
+                x in ot for x in ("заработок", "награда", "квест")
+            ):
                 score += 1.5
+
             score += s.get("confidence", 0.5) * 0.6
-            scored.append((score, -i, opt))
-        scored.sort(reverse=True)
-        result = {"decision": scored[0][2],
-                  "reason": "безопасность, мотивации, экономика, автономия",
-                  "scores": [{"option": x[2], "score": round(x[0], 3)} for x in scored],
-                  "tool_hints": tool_hints, "time": now_iso()}
-        return result
+
+            scored.append(
+                {
+                    "option": opt,
+                    "score": round(score, 3),
+                    "reasons": reasons,
+                    "_index": i,
+                }
+            )
+
+        scored.sort(key=lambda x: (-x["score"], x["_index"]))
+
+        best = scored[0]
+
+        return {
+            "decision": best["option"],
+            "reason": (
+                "оценка текущего open_loop, принципов и ограничений "
+                "Core; затем безопасность и мотивации"
+            ),
+            "scores": [
+                {
+                    "option": x["option"],
+                    "score": x["score"],
+                    "reasons": x["reasons"],
+                }
+                for x in scored
+            ],
+            "tool_hints": tool_hints,
+            "time": now_iso(),
+        }
 
     def _state_guidance(self):
         if not self.state:
@@ -1183,6 +1546,13 @@ class CognitiveEngine:
         if self.state: self.state.adapt_from_text(request)
         memories = self.memory.search(request, limit=MAX_MEMORY_RESULTS)
         if not memories: memories = self.memory.important(5)
+
+        # Rebuild runtime semantic context from persistent memory.
+        self._build_semantic_context(
+            request=request,
+            memories=memories,
+        )
+
         self.recalculate_motivations()
         source = "local"; response = ""
 
@@ -1252,49 +1622,31 @@ class CognitiveEngine:
         )
 
         for rule in rules:
-            rule_subject = str(rule.text).lower()
+            target_subject = rule_subject(rule.text)
 
-            # Сначала ищем самое новое состояние, относящееся к субъекту
-            # правила. Историческое состояние того же субъекта не может
-            # заменить более новое состояние.
+            # Сначала рассматриваем самое новое состояние целевого объекта.
+            # Чужие объекты и состояния без определённого субъекта пропускаем.
             rule_result = None
 
             for state in states:
-                result = infer_rule_state(rule.text, state.text)
+                current_subject = state_subject(state.text)
 
+                if target_subject:
+                    if current_subject != target_subject:
+                        continue
+
+                    result = infer_rule_state(rule.text, state.text)
+                    if result is not None:
+                        rule_result = result
+                    # Найдено самое новое состояние этого объекта.
+                    # Если условие не выполнено, старые состояния не подходят.
+                    break
+
+                # Для правил без явного субъекта сохраняем прежнее поведение.
+                result = infer_rule_state(rule.text, state.text)
                 if result is not None:
                     rule_result = result
                     break
-
-                # Если состояние явно относится к субъекту правила, но
-                # правило сейчас не выполняется, это является текущим
-                # отрицательным состоянием. Старые состояния больше
-                # не рассматриваем.
-                state_text = str(state.text).lower()
-                subject = result.get("subject") if result else None
-
-                if subject:
-                    continue
-
-                # Для состояний без явного субъекта infer_rule_state()
-                # может вернуть None и при этом не позволить определить,
-                # относится ли состояние к правилу. Такие состояния не
-                # блокируют поиск.
-                if any(token in state_text for token in (
-                    "электричество",
-                    "заряд",
-                    "аккумулятор",
-                    "перегрев",
-                    "температура",
-                )):
-                    if (
-                        "электричеств" in rule_subject
-                        or "заряд" in rule_subject
-                        or "аккумулятор" in rule_subject
-                        or "перегрев" in rule_subject
-                        or "температур" in rule_subject
-                    ):
-                        break
 
             if rule_result is None:
                 continue
@@ -1325,6 +1677,54 @@ class CognitiveEngine:
 
     def _local(self, request, memories):
         low = request.lower()
+        context = self.context.snapshot()
+
+        # Use the restored semantic context for continuation requests.
+        if any(w in low for w in (
+            "дальше", "продолж", "следующ", "где останов",
+            "с чего начать"
+        )):
+            next_step = context.get("next_step")
+            if next_step:
+                return f"Продолжаем: {next_step}"
+
+        # Report the currently restored unfinished work.
+        if any(w in low for w in (
+            "что осталось", "незаверш", "открыт", "что не законч"
+        )):
+            open_loops = context.get("open_loops") or []
+            if open_loops:
+                return "Открытые задачи:\n" + "\n".join(
+                    f"  • {item}" for item in open_loops[:5]
+                )
+
+        # Report restored project direction.
+        if any(w in low for w in (
+            "где останов", "что мы делаем", "над чем работаем",
+            "какой проект"
+        )):
+            project = context.get("project") or []
+            next_step = context.get("next_step")
+            parts = []
+            if project:
+                parts.append("Проект:\n" + "\n".join(
+                    f"  • {item}" for item in project[:5]
+                ))
+            if next_step:
+                parts.append(f"Следующий шаг: {next_step}")
+            if parts:
+                return "\n".join(parts)
+
+        # Report restored constraints/principles.
+        if any(w in low for w in (
+            "ограничен", "ограничения", "правил", "принцип"
+        )):
+            constraints = context.get("constraints") or []
+            if constraints:
+                return "Ограничения:\n" + "\n".join(
+                    f"  • {item}" for item in constraints[:5]
+                )
+
         if any(w in low.split() for w in ("что", "как", "почему", "зачем", "где", "когда", "кто")):
             identity = self.memory.recall_identity()
             if memories:
@@ -1476,7 +1876,12 @@ class NightWorker:
         principles = self.memory.principles(5)
         open_loops = self.memory.open_loops(8)
         if not mems and not principles and not open_loops: return "Сегодня я ничего не запомнил."
-        diary = [f"• {m.text[:150]}" for m in mems if m.kind in ("dialog", "general", "experience")]
+        diary = [
+            f"• {m.text[:150]}"
+            for m in mems
+            if m.kind in ("dialog", "general", "experience")
+            and getattr(m, "text", None)
+        ]
         pat = self.mind.notice_words(limit=30, min_count=2)
         pat_lines = [f"• «{w}» — {c}" for w, c in pat[:5]]
         emo = self.mind.notice_emotions(limit=30)
@@ -1484,6 +1889,8 @@ class NightWorker:
         goals = []
         for m in mems:
             if m.kind not in ("dialog", "general", "experience"):
+                continue
+            if not getattr(m, "text", None):
                 continue
             if any(mk in m.text.lower() for mk in ("хочу", "надо", "должен", "планирую", "нужно")):
                 goals.append(f"• {m.text[:150]}")
@@ -1608,16 +2015,20 @@ class PeerDirectory:
 # ============================================================
 
 class P2PNetwork:
-    def __init__(self, node, udp_port=P2P_UDP_PORT, tcp_port=P2P_TCP_PORT):
-        self.node = node; self.udp_port = udp_port; self.tcp_port = tcp_port
+    def __init__(
+        self,
+        node,
+        udp_port=P2P_UDP_PORT,
+        tcp_port=P2P_TCP_PORT,
+        scp_identity=None,
+    ):
+        self.node = node
+        self.udp_port = udp_port
+        self.tcp_port = tcp_port
         self.running = False
 
-        # Existing SCP-1 identity/security attached to P2P.
-        self.scp_identity = (
-            get_node_identity()
-            if get_node_identity is not None
-            else None
-        )
+        # SCP-1 identity is owned by the Symbiont root and injected into P2P.
+        self.scp_identity = scp_identity
 
         trusted_raw = os.getenv(
             "SYMBIONT_SCP1_TRUSTED_NODES",
@@ -1680,7 +2091,7 @@ class P2PNetwork:
 
         return {"scp1": packet}
 
-    def _scp1_unwrap(self, wire):
+    def _scp1_unwrap(self, wire, expected_peer_id=None):
         if (
             not self.scp1_enabled
             or self.scp1 is None
@@ -1697,6 +2108,12 @@ class P2PNetwork:
             return None
 
         if not self.scp1.verify(packet):
+            return None
+
+        if (
+            expected_peer_id is not None
+            and str(packet.get("node_id", "")) != str(expected_peer_id)
+        ):
             return None
 
         payload = packet.get("payload")
@@ -1832,6 +2249,67 @@ class P2PNetwork:
             if action == "QUEST_OFFER":
                 resp = self.node.quests.handle_incoming(req)
 
+            elif action == "QUEST_PAYMENT":
+                quest_id = req.get("quest_id")
+                creator = req.get("creator")
+                worker = req.get("worker")
+                reward = req.get("reward")
+                currency = req.get("currency")
+
+                if creator != sender:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "creator_sender_mismatch",
+                    }
+
+                elif worker != self.node.identity.id():
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "worker_mismatch",
+                    }
+
+                elif not quest_id:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "missing_quest_id",
+                    }
+
+                elif not isinstance(reward, (int, float)) or reward <= 0:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "invalid_reward",
+                    }
+
+                elif currency != CURRENCY:
+                    resp = {
+                        "status": "PAYMENT_REJECTED",
+                        "reason": "invalid_currency",
+                    }
+
+                else:
+                    received = self.node.economy.receive_quest_payment(
+                        quest_id,
+                        float(reward),
+                        creator,
+                        worker,
+                        currency,
+                    )
+
+                    if received:
+                        resp = {
+                            "status": "PAYMENT_RECEIVED",
+                            "quest_id": quest_id,
+                            "worker": worker,
+                            "reward": float(reward),
+                            "currency": currency,
+                        }
+                    else:
+                        resp = {
+                            "status": "PAYMENT_REJECTED",
+                            "reason": "duplicate_or_invalid_payment",
+                            "quest_id": quest_id,
+                        }
+
             elif action == "PING":
                 resp = {
                     "status": "PONG",
@@ -1913,7 +2391,7 @@ class P2PNetwork:
             )
 
             if self.scp1_enabled:
-                return self._scp1_unwrap(response)
+                return self._scp1_unwrap(response, expected_peer_id=peer_id)
 
             return response
 
@@ -1987,32 +2465,48 @@ class QuestBoard:
         resp = self.node.p2p.send_to(peer_id, packet)
 
         if resp and resp.get("status") == "COMPLETED":
-            released = self.node.settlement.release(
-                q.quest_id,
-                peer_id,
-            )
+            payment_packet = {
+                "action": "QUEST_PAYMENT",
+                "quest_id": q.quest_id,
+                "creator": q.creator,
+                "worker": peer_id,
+                "reward": q.reward,
+                "currency": CURRENCY,
+            }
 
-            if released is not False:
-                q.status = "completed"
-                q.assignee = peer_id
-                q.completed_at = now_iso()
-                self.node.journal.append(
-                    "quest.delegated.done",
-                    {
-                        "quest_id": q.quest_id,
-                        "peer": peer_id,
-                        "result": resp.get("result", "")[:500],
-                    },
+            payment_resp = self.node.p2p.send_to(peer_id, payment_packet)
+
+            if payment_resp and payment_resp.get("status") == "PAYMENT_RECEIVED":
+                finalized = self.node.economy.finalize_quest_payment(
+                    q.quest_id,
+                    worker_node=peer_id,
                 )
-                return q, resp.get("result", "")
 
-            # Release failed: freeze the escrow rather than silently
-            # losing the reserved reward.
+                if finalized is not False:
+                    q.status = "completed"
+                    q.assignee = peer_id
+                    q.completed_at = now_iso()
+                    self.node.journal.append(
+                        "quest.delegated.done",
+                        {
+                            "quest_id": q.quest_id,
+                            "peer": peer_id,
+                            "result": resp.get("result", "")[:500],
+                        },
+                    )
+                    return q, resp.get("result", "")
+
+                self.node.settlement.freeze(
+                    q.quest_id,
+                    "Quest completed and payment received but escrow finalization failed",
+                )
+                return q, "Квест выполнен, выплата получена, но escrow не финализирован"
+
             self.node.settlement.freeze(
                 q.quest_id,
-                "Quest completed but settlement release failed",
+                "Quest completed but worker payment was not confirmed",
             )
-            return q, "Квест выполнен, но выплата заморожена"
+            return q, "Квест выполнен, но выплата не подтверждена"
 
         # Peer unavailable / rejected: return reserved reward.
         self.node.settlement.refund(q.quest_id)
@@ -2031,6 +2525,21 @@ class QuestBoard:
             return {"status": "REJECTED",
                     "reason": f"Low battery ({batt:.1f}%)",
                     "worker": self.node.identity.id()}
+
+        # Replay guard: EventJournal is the existing persistent source
+        # of truth for completed incoming quests.
+        if quest_id:
+            for event in self.node.journal.all_events():
+                if (
+                    event.get("type") == "quest.incoming.done"
+                    and str(event.get("payload", {}).get("quest_id")) == str(quest_id)
+                ):
+                    return {
+                        "status": "REPLAYED",
+                        "quest_id": quest_id,
+                        "worker": self.node.identity.id(),
+                        "battery": batt,
+                    }
 
         result = self.node.mind.think(desc)
         self.node.memory.remember(
@@ -2054,7 +2563,7 @@ class Wallet:
 class Economy:
     def __init__(self, path, journal):
         self.path = path; self.journal = journal; self.lock = threading.RLock()
-        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self._load()
+        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self._load()
 
     def _load(self):
         if not self.path.exists(): return
@@ -2063,7 +2572,7 @@ class Economy:
             self.wallet = Wallet(float(w.get("balance", 0)),
                                  float(w.get("lifetime_received", 0)),
                                  float(w.get("lifetime_spent", 0)))
-            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {})
+            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {}); self.payments = data.get("payments", {})
         except Exception: pass
 
     def _save(self):
@@ -2071,7 +2580,7 @@ class Economy:
             "wallet": asdict(self.wallet),
             "last_food_allocation": self.last_food,
             "currency": CURRENCY,
-            "escrow": self.escrow}, ensure_ascii=False, indent=2))
+            "escrow": self.escrow, "payments": self.payments}, ensure_ascii=False, indent=2))
 
     def credit(self, amount, reason):
         amount = float(amount)
@@ -2242,6 +2751,152 @@ class Economy:
         self.credit(reward, f"Quest reward #{quest_id}")
         return self.wallet.balance
 
+    def finalize_quest_payment(self, quest_id, worker_node=""):
+        """Finalize an already-paid quest without refunding the creator."""
+        quest_id = str(quest_id)
+
+        with self.lock:
+            tx = self.escrow.get(quest_id)
+            if not tx:
+                return False
+
+            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+                return False
+
+            reward = float(tx.get("reward", 0))
+            if reward <= 0:
+                return False
+
+            tx["worker_node"] = worker_node or tx.get("worker_node", "")
+            tx["status"] = "RELEASED"
+            tx["escrow_state"] = "RELEASED"
+            tx["released_at"] = now_iso()
+            tx["payment_finalized"] = True
+
+            self._save()
+            self.journal.append(
+                "economy.escrow_payment_finalized",
+                {
+                    "quest_id": quest_id,
+                    "reward": reward,
+                    "worker_node": tx.get("worker_node", ""),
+                },
+            )
+
+            return reward
+
+    def receive_quest_payment(
+        self,
+        quest_id,
+        amount,
+        creator_node="",
+        worker_node="",
+        currency=None,
+    ):
+        """Receive a quest payment exactly once, bound to persisted execution proof."""
+        with self.lock:
+            try:
+                amount = float(amount)
+            except (TypeError, ValueError):
+                return False
+
+            if amount <= 0:
+                return False
+
+            quest_id = str(quest_id)
+            if not quest_id:
+                return False
+
+            # Worker-side source of truth:
+            # the existing persistent execution proof.
+            execution_events = [
+                event
+                for event in self.journal.all_events()
+                if (
+                    event.get("type") == "quest.incoming.done"
+                    and str(
+                        event.get("payload", {}).get("quest_id")
+                    ) == quest_id
+                )
+            ]
+
+            # Exactly one execution proof is required.
+            # Zero means the Quest was never executed.
+            # More than one means the execution history is ambiguous.
+            if len(execution_events) != 1:
+                return False
+
+            execution = execution_events[0].get("payload", {})
+
+            execution_creator = str(
+                execution.get("from", "")
+            )
+
+            execution_reward_raw = execution.get("reward")
+
+            try:
+                execution_reward = float(execution_reward_raw)
+            except (TypeError, ValueError):
+                return False
+
+            if execution_reward <= 0:
+                return False
+
+            # Bind payment to the persisted execution proof.
+            if str(creator_node) != execution_creator:
+                return False
+
+            if amount != execution_reward:
+                return False
+
+            if currency is None:
+                currency = CURRENCY
+
+            if currency != CURRENCY:
+                return False
+
+            # worker_node is already authenticated by the P2P layer
+            # before this Economy method is called. Keep it in the
+            # persistent receipt, but do not introduce a new identity
+            # dependency into Economy.
+            worker_node = str(worker_node)
+
+            if not worker_node:
+                return False
+
+            if quest_id in self.payments:
+                return False
+
+            # The persisted execution proof, not the incoming packet,
+            # determines the amount credited to the Worker.
+            receipt = {
+                "quest_id": quest_id,
+                "creator_node": execution_creator,
+                "worker_node": worker_node,
+                "amount": execution_reward,
+                "currency": CURRENCY,
+                "received_at": datetime.utcnow().isoformat() + "Z",
+            }
+
+            self.wallet.balance += execution_reward
+            self.wallet.lifetime_received += execution_reward
+            self.payments[quest_id] = receipt
+
+            self._save()
+
+            self.journal.append(
+                "economy.payment_received",
+                {
+                    "quest_id": quest_id,
+                    "creator_node": execution_creator,
+                    "worker_node": worker_node,
+                    "amount": execution_reward,
+                    "currency": CURRENCY,
+                },
+            )
+
+            return True
+
     def snapshot(self):
         with self.lock:
             return {"currency": CURRENCY, "balance": round(self.wallet.balance, 2),
@@ -2301,15 +2956,98 @@ class PermissionGate:
 # ============================================================
 
 class ContextBus:
+    """
+    Runtime semantic context.
+
+    ContextBus is NOT a second memory store.
+    MemoryVault remains the source of truth.
+
+    The bus holds a derived semantic snapshot of the current work:
+        identity
+        project
+        goal
+        open_loops
+        principles
+        preferences
+        recent_work
+        current_state
+        next_step
+        constraints
+
+    This allows a fresh Symbiont process to reconstruct meaning from
+    persistent memory without requiring an LLM.
+    """
+
+    GROUPS = (
+        "identity",
+        "project",
+        "goal",
+        "open_loops",
+        "principles",
+        "preferences",
+        "recent_work",
+        "current_state",
+        "next_step",
+        "constraints",
+    )
+
     def __init__(self):
-        self.lock = threading.RLock(); self.data = {}
+        self.lock = threading.RLock()
+        self.data = {}
 
     def update(self, **kwargs):
-        with self.lock: self.data.update(kwargs)
-        return self.data
+        with self.lock:
+            for key, value in kwargs.items():
+                self.data[key] = value
+        return self.snapshot()
+
+    def set_group(self, name, value):
+        name = str(name).strip().lower()
+        if name not in self.GROUPS:
+            raise ValueError(
+                f"Unknown semantic group: {name}. "
+                f"Allowed: {', '.join(self.GROUPS)}"
+            )
+        with self.lock:
+            self.data[name] = value
+        return value
+
+    def get_group(self, name, default=None):
+        with self.lock:
+            return self.data.get(str(name).strip().lower(), default)
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                key: value
+                for key, value in self.data.items()
+            }
 
     def get(self):
-        with self.lock: return dict(self.data) if self.data else None
+        return self.snapshot() if self.data else None
+
+    def clear(self):
+        with self.lock:
+            self.data.clear()
+
+    def has(self, name):
+        with self.lock:
+            return str(name).strip().lower() in self.data
+
+    def missing(self):
+        with self.lock:
+            return [
+                name for name in self.GROUPS
+                if name not in self.data
+            ]
+
+    def summary(self):
+        with self.lock:
+            return {
+                "groups": list(self.data.keys()),
+                "complete": not self.missing(),
+                "missing": self.missing(),
+            }
 
 
 # ============================================================
@@ -2332,7 +3070,8 @@ class Symbiont:
                 self.identity,
             )
             self.journal.add_listener(
-                self.continuity_shadow.on_core_event
+                self.continuity_shadow.on_core_event,
+                replay_existing=True,
             )
 
         self.profile = AgentProfile(self.root / "agent.json")
@@ -2364,6 +3103,11 @@ class Symbiont:
         self.mind = CognitiveEngine(self.memory, self.context, self.journal)
         self.mind.profile = self.profile
         self.mind.state = self.state
+
+        # Restore derived semantic context from persistent Core sources.
+        # ContextBus remains a runtime view; MemoryVault remains authoritative.
+        self.mind._build_semantic_context()
+
         self.night_worker = NightWorker(self.memory, self.mind, self.journal, self.memory_v2)
         self.listener = AmbientListener(self.mind, self.memory, self.journal)
         self.economy = Economy(self.root / "state.json", self.journal)
@@ -2381,7 +3125,9 @@ class Symbiont:
             in {"1", "true", "yes", "on"}
         ):
             try:
-                self.smsa = SMSA()
+                self.smsa = SMSA(
+                    policy_path=self.root / "security_policy.json"
+                )
                 self.permissions.add_listener(
                     self._sync_permission_to_smsa
                 )
@@ -2409,7 +3155,65 @@ class Symbiont:
 
         self.peers = PeerDirectory()
         self.quests = QuestBoard(self)
-        self.p2p = P2PNetwork(self)
+        # NodeIdentity failure disables SCP-1 identity only; Core keeps its data.
+        self.scp_identity = None
+        if NodeIdentity is not None:
+            try:
+                self.scp_identity = NodeIdentity(
+                    self.root / "node_identity.json"
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "node_identity.initialization_failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "mode": "identity_preserved_scp1_disabled",
+                    },
+                )
+
+        # TSK is optional and non-destructive:
+        # Load only an existing, integrity-checked TSK state.
+        # Never derive a separate TSK identity implicitly from Core's phrase.
+        self.tsk = None
+        self.tsk_initialization_error = None
+        if TrustedSecurityKernel is not None:
+            try:
+                tsk_state_path = self.root / "tsk_state.json"
+                if tsk_state_path.exists():
+                    self.tsk = TrustedSecurityKernel(root=self.root)
+
+                if self.tsk is not None:
+                    self.tsk.record_identity_observation(
+                        identity_type="CoreIdentity",
+                        identity_id=self.identity.id(),
+                        public_key_fingerprint=hashlib.sha256(
+                            str(self.identity.public_key()).encode("utf-8")
+                        ).hexdigest(),
+                        source="identity.json",
+                        reason=(
+                            "legacy_core_identity_requires_explicit_"
+                            "cryptographic_binding"
+                        ),
+                    )
+                    if self.scp_identity is not None:
+                        self.tsk.adopt_node_identity(
+                            self.root / "node_identity.json"
+                        )
+            except Exception as exc:
+                self.tsk = None
+                self.tsk_initialization_error = type(exc).__name__
+                self.journal.append(
+                    "tsk.initialization_failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "mode": "non_destructive",
+                    },
+                )
+
+        self.p2p = P2PNetwork(
+            self,
+            scp_identity=self.scp_identity,
+        )
         self.tools = ToolRegistry(self)
         self.mind.connect_tools(self.tools)
         self.sync_engine = MemorySyncEngine(self)

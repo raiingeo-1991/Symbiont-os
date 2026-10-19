@@ -334,9 +334,9 @@ class OwnerPolicy:
 
 
 class SecurePolicy:
-    def __init__(self):
+    def __init__(self, path="symbiont_data/security_policy.json"):
         self.gate = CapabilityGate()
-        self.owner = OwnerPolicy()
+        self.owner = OwnerPolicy(path)
 
         for capability, value in self.owner.snapshot().items():
             if value:
@@ -579,9 +579,9 @@ def get_module_registry(security=None):
 class SMSA:
     VERSION = "SMSA/1.0"
 
-    def __init__(self):
+    def __init__(self, policy_path="symbiont_data/security_policy.json"):
         self.security = get_security()
-        self.policy = SecurePolicy()
+        self.policy = SecurePolicy(policy_path)
 
         # SMSA policy and SecurityManager must use the same
         # capability gate. This keeps SecureSettlement,

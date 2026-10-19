@@ -125,6 +125,32 @@ class ContinuityShadow:
         if not core_event_id or core_event_id in self._events_seen:
             return
 
+        # Preserve Core EventJournal order. If a previous event was missed,
+        # do not append a later event over the gap; startup replay can repair it.
+        if "previous" in event:
+            last_core_event = next(
+                (
+                    item for item in reversed(self.ledger.events())
+                    if item.payload.get("core_event_id")
+                ),
+                None,
+            )
+            if last_core_event is None:
+                expected_previous = "0" * 64
+            else:
+                expected_previous = last_core_event.payload.get(
+                    "core_event_hash"
+                )
+                if not expected_previous:
+                    raise ContinuityVerificationError(
+                        "SCA-1 cannot verify the previous Core event hash"
+                    )
+
+            if event.get("previous") != expected_previous:
+                raise ContinuityVerificationError(
+                    "Core EventJournal gap detected; refusing out-of-order Shadow append"
+                )
+
         event_type = str(event.get("type", "core.event"))
 
         category = self._category(event_type)

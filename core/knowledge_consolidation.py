@@ -103,12 +103,17 @@ class KnowledgeConsolidation:
             evidence,
         )
 
+        metadata = dict(
+            getattr(candidate, "metadata", {}) or {}
+        )
+
         provenance = {
             "source": source,
             "evidence_count": len(evidence),
             "evidence": list(evidence),
             "created_at": time.time(),
             "engine_version": self.VERSION,
+            "metadata": metadata,
         }
 
         return KnowledgeCandidate(

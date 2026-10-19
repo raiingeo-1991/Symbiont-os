@@ -104,6 +104,17 @@ class NodeIdentity:
                     "Node identity integrity check failed"
                 )
 
+            # Prove that the private key matches the stored public key.
+            challenge = b"SYMBIONT-NODE-IDENTITY-KEYPAIR-CHECK-v1"
+            try:
+                signature = self.sign(challenge)
+                if not self.verify(challenge, signature):
+                    raise RuntimeError("Node identity keypair mismatch")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Node identity keypair validation failed"
+                ) from exc
+
             self.node_id = calculated
             return
 
