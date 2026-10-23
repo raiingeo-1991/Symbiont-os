@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
+import fcntl
 import hashlib
 import hmac
 import json
@@ -9,6 +12,7 @@ import os
 import secrets
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -29,6 +33,22 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Serialize cooperating processes using a persistent lock file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with os.fdopen(fd, "a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    except BaseException:
+        raise
+
+
 class AnchorLedger:
     """
     Experimental ledger.
@@ -46,50 +66,53 @@ class AnchorLedger:
         self.database = Path(database)
         self.checkpoint = Path(checkpoint)
         self.key_file = Path(key_file)
+        self.lock = threading.RLock()
+        self.lock_path = self.database.with_name(self.database.name + ".lock")
 
-        paths = (self.database, self.checkpoint, self.key_file)
-        existed = tuple(p.exists() for p in paths)
-
-        if any(existed) and not all(existed):
-            raise IntegrityError(
-                "Incomplete ledger state: refusing implicit reinitialization"
-            )
-
-        for path in paths:
+        for path in (self.database, self.checkpoint, self.key_file):
             path.parent.mkdir(parents=True, exist_ok=True)
 
-        if not any(existed):
-            self._create_key_exclusive()
+        with self.lock, _exclusive_file_lock(self.lock_path):
+            paths = (self.database, self.checkpoint, self.key_file)
+            existed = tuple(p.exists() for p in paths)
 
-        self.key = self.key_file.read_bytes()
-        if len(self.key) != 32:
-            raise IntegrityError("Invalid checkpoint authentication key")
-
-        if not any(existed):
-            self.db = sqlite3.connect(str(self.database))
-            self.db.row_factory = sqlite3.Row
-            self.db.execute("PRAGMA synchronous=FULL")
-            self.db.execute("PRAGMA journal_mode=DELETE")
-            self.db.execute("""
-                CREATE TABLE evidence (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    summary TEXT NOT NULL,
-                    previous_hash TEXT NOT NULL,
-                    record_hash TEXT NOT NULL
+            if any(existed) and not all(existed):
+                raise IntegrityError(
+                    "Incomplete ledger state: refusing implicit reinitialization"
                 )
-            """)
-            self.db.commit()
-            self._write_checkpoint(0, ZERO_HASH)
-        else:
-            self.db = sqlite3.connect(str(self.database))
+
+            if not any(existed):
+                self._create_key_exclusive()
+
+            self.key = self.key_file.read_bytes()
+            if len(self.key) != 32:
+                raise IntegrityError("Invalid checkpoint authentication key")
+
+            self.db = sqlite3.connect(
+                str(self.database), check_same_thread=False
+            )
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA synchronous=FULL")
-        if len(self.key) != 32:
-            self.db.close()
-            raise IntegrityError("Invalid checkpoint authentication key")
 
-        self.verify_or_raise()
+            try:
+                if not any(existed):
+                    self.db.execute("PRAGMA journal_mode=DELETE")
+                    self.db.execute("""
+                        CREATE TABLE evidence (
+                            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_id TEXT NOT NULL UNIQUE,
+                            summary TEXT NOT NULL,
+                            previous_hash TEXT NOT NULL,
+                            record_hash TEXT NOT NULL
+                        )
+                    """)
+                    self.db.commit()
+                    self._write_checkpoint(0, ZERO_HASH)
+
+                self._verify_or_raise_unlocked()
+            except BaseException:
+                self.db.close()
+                raise
 
     def _create_key_exclusive(self) -> None:
         # Exclusive creation prevents accidental overwriting of an existing key.
@@ -174,7 +197,7 @@ class AnchorLedger:
             "previous_hash": previous_hash,
         })
 
-    def verify(self) -> tuple[bool, int]:
+    def _verify_unlocked(self) -> tuple[bool, int]:
         try:
             checkpoint = self._read_checkpoint()
             previous = ZERO_HASH
@@ -216,58 +239,68 @@ class AnchorLedger:
         except (sqlite3.Error, IntegrityError, TypeError, ValueError):
             return False, 0
 
-    def verify_or_raise(self) -> int:
-        valid, count = self.verify()
+    def verify(self) -> tuple[bool, int]:
+        with self.lock, _exclusive_file_lock(self.lock_path):
+            return self._verify_unlocked()
+
+    def _verify_or_raise_unlocked(self) -> int:
+        valid, count = self._verify_unlocked()
         if not valid:
-            raise IntegrityError("Ledger/checkpoint integrity verification failed")
+            raise IntegrityError(
+                "Ledger/checkpoint integrity verification failed"
+            )
         return count
 
+    def verify_or_raise(self) -> int:
+        with self.lock, _exclusive_file_lock(self.lock_path):
+            return self._verify_or_raise_unlocked()
+
     def append(self, event_id: str, summary: str) -> str:
-        event_id = str(event_id).strip()
-        summary = str(summary).strip()
+        with self.lock, _exclusive_file_lock(self.lock_path):
+            event_id = str(event_id).strip()
+            summary = str(summary).strip()
 
-        if not event_id or not summary:
-            raise ValueError("event_id and summary are required")
+            if not event_id or not summary:
+                raise ValueError("event_id and summary are required")
 
-        self.verify_or_raise()
+            self._verify_or_raise_unlocked()
 
-        existing = self.db.execute(
-            "SELECT * FROM evidence WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        if existing:
-            if existing["summary"] != summary:
-                raise ValueError("Conflicting event redelivery")
-            return existing["record_hash"]
+            existing = self.db.execute(
+                "SELECT * FROM evidence WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            if existing:
+                if existing["summary"] != summary:
+                    raise ValueError("Conflicting event redelivery")
+                return existing["record_hash"]
 
-        last = self.db.execute(
-            "SELECT sequence, record_hash FROM evidence "
-            "ORDER BY sequence DESC LIMIT 1"
-        ).fetchone()
+            last = self.db.execute(
+                "SELECT sequence, record_hash FROM evidence "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
 
-        sequence = (last["sequence"] + 1) if last else 1
-        previous = last["record_hash"] if last else ZERO_HASH
-        record_hash = self._record_hash(
-            sequence, event_id, summary, previous
-        )
-
-        try:
-            self.db.execute("BEGIN IMMEDIATE")
-            self.db.execute(
-                "INSERT INTO evidence "
-                "(sequence, event_id, summary, previous_hash, record_hash) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (sequence, event_id, summary, previous, record_hash),
+            sequence = (last["sequence"] + 1) if last else 1
+            previous = last["record_hash"] if last else ZERO_HASH
+            record_hash = self._record_hash(
+                sequence, event_id, summary, previous
             )
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            raise
 
-        # Deliberately fail closed if checkpoint update fails after DB commit.
-        # Recovery must not silently invent a new trusted checkpoint.
-        self._write_checkpoint(sequence, record_hash)
-        self.verify_or_raise()
-        return record_hash
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                self.db.execute(
+                    "INSERT INTO evidence "
+                    "(sequence, event_id, summary, previous_hash, record_hash) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (sequence, event_id, summary, previous, record_hash),
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+
+            # Fail closed if checkpoint writing fails after the DB commit.
+            self._write_checkpoint(sequence, record_hash)
+            self._verify_or_raise_unlocked()
+            return record_hash
 
     def close(self) -> None:
         self.db.close()
