@@ -592,6 +592,89 @@ class TrustedSecurityKernel:
                 self._save_state()
         return True
 
+    def confirm_core_node_binding(
+        self,
+        *,
+        core_id: str,
+        core_public_key_fingerprint: str,
+        node_identity_path: str | Path,
+        owner_confirmation: str,
+    ) -> bool:
+        """Record an explicitly owner-confirmed Core ID <-> NodeIdentity binding.
+
+        This method is intended for a local owner-controlled workflow.
+        Observations and trust scores never create this binding automatically.
+        """
+        core_id = str(core_id).strip()
+        core_fp = str(core_public_key_fingerprint).strip().lower()
+        if (
+            not core_id
+            or len(core_fp) != 64
+            or any(ch not in "0123456789abcdef" for ch in core_fp)
+        ):
+            raise TSKError("Invalid Core identity or public-key fingerprint")
+
+        path = Path(node_identity_path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            private_pem = base64.b64decode(data["private_key"], validate=True)
+            public_pem = base64.b64decode(data["public_key"], validate=True)
+            node_id = _Ed25519.node_id_from_public(public_pem)
+            if data.get("node_id") != node_id:
+                raise TSKIntegrityError("NodeIdentity ID does not match public key")
+            self._validate_key_material(private_pem, public_pem, node_id)
+        except TSKError:
+            raise
+        except Exception as exc:
+            raise TSKIntegrityError("Cannot validate NodeIdentity for binding") from exc
+
+        expected = f"BIND {core_id} TO NODE {node_id}"
+        if not secrets.compare_digest(str(owner_confirmation), expected):
+            raise TSKError(f"Owner confirmation must exactly match: {expected}")
+
+        # Explicitly exercise the NodeIdentity private key before accepting the
+        # local binding; this is a key-possession check, not owner approval.
+        challenge = b"TSK-CORE-NODE-BINDING-v1:" + secrets.token_bytes(32)
+        proof = _Ed25519.sign(private_pem, challenge)
+        if not _Ed25519.verify(public_pem, challenge, proof):
+            raise TSKIntegrityError("NodeIdentity proof-of-possession failed")
+
+        node_fp = hashlib.sha256(public_pem).hexdigest()
+        record = {
+            "identity_type": "CoreNodeBinding",
+            "identity_id": f"{core_id}|{node_id}",
+            "core_id": core_id,
+            "core_public_key_fingerprint": core_fp,
+            "node_id": node_id,
+            "node_public_key_fingerprint": node_fp,
+            "public_key_fingerprint": node_fp,
+            "status": "owner_confirmed",
+            "root_node_id_at_observation": self._node_id or "",
+            "source": path.name,
+            "confirmed_at": _now_iso(),
+            "owner_confirmation_hash": _sha256(expected.encode("utf-8")),
+            "reason": "explicit_local_owner_confirmation_and_key_possession",
+        }
+
+        with self._lock:
+            for existing in self._identity_bindings:
+                if (
+                    existing.get("identity_type") == "CoreNodeBinding"
+                    and existing.get("core_id") == core_id
+                    and existing.get("node_id") == node_id
+                    and existing.get("core_public_key_fingerprint") == core_fp
+                    and existing.get("node_public_key_fingerprint") == node_fp
+                    and existing.get("status") == "owner_confirmed"
+                ):
+                    return True
+            self._identity_bindings.append(record)
+            self._experience.add_event(
+                "tsk.identity_binding_owner_confirmed",
+                {"core_id": core_id, "node_id": node_id},
+            )
+            self._save_state()
+        return True
+
     # ----------------------------------------------------------
     # Trust Graph
     # ----------------------------------------------------------

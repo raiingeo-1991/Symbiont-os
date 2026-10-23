@@ -7,6 +7,7 @@ SYMBIONT CORE v11.0
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -32,6 +33,16 @@ try:
     from core.continuity.shadow import ContinuityShadow
 except Exception:
     ContinuityShadow = None
+
+try:
+    from core.sss.immune_memory import ImmuneMemory
+except Exception:
+    ImmuneMemory = None
+
+try:
+    from core.sss.sis_integrity import SISIntegrity
+except Exception:
+    SISIntegrity = None
 
 try:
     from core.security import SMSA, get_secure_settlement
@@ -2091,7 +2102,7 @@ class P2PNetwork:
 
         return {"scp1": packet}
 
-    def _scp1_unwrap(self, wire, expected_peer_id=None):
+    def _scp1_unwrap(self, wire, expected_peer_id=None, return_identity=False):
         if (
             not self.scp1_enabled
             or self.scp1 is None
@@ -2121,7 +2132,44 @@ class P2PNetwork:
         if not isinstance(payload, dict):
             return None
 
+        if return_identity:
+            try:
+                public_pem = base64.b64decode(
+                    packet["public_key"], validate=True
+                )
+            except Exception:
+                return None
+            return payload, {
+                "node_id": str(packet.get("node_id", "")),
+                "public_key_fingerprint": hashlib.sha256(public_pem).hexdigest(),
+            }
+
         return payload
+
+    def _scp1_binding_matches(self, sender, peer, signer):
+        """Require a persisted owner-confirmed Core ID <-> SCP-1 key binding."""
+        if not sender or peer is None or not isinstance(signer, dict):
+            return False
+        tsk = getattr(self.node, "tsk", None)
+        if tsk is None:
+            return False
+        try:
+            core_fp = hashlib.sha256(
+                str(peer.public_key).encode("utf-8")
+            ).hexdigest()
+            node_id = str(signer.get("node_id", ""))
+            node_fp = str(signer.get("public_key_fingerprint", ""))
+            return any(
+                item.get("identity_type") == "CoreNodeBinding"
+                and item.get("status") == "owner_confirmed"
+                and item.get("core_id") == str(sender)
+                and item.get("core_public_key_fingerprint") == core_fp
+                and item.get("node_id") == node_id
+                and item.get("node_public_key_fingerprint") == node_fp
+                for item in tsk.list_identity_bindings()
+            )
+        except Exception:
+            return False
 
     def _udp_beacon(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2198,10 +2246,13 @@ class P2PNetwork:
 
             # SCP-1 becomes the authenticated network envelope
             # when explicitly enabled.
+            scp_signer = None
             if self.scp1_enabled:
-                req = self._scp1_unwrap(wire)
+                unwrapped = self._scp1_unwrap(
+                    wire, return_identity=True
+                )
 
-                if req is None:
+                if unwrapped is None:
                     conn.sendall(
                         canonical_json({
                             "status": "UNAUTHORIZED",
@@ -2209,6 +2260,8 @@ class P2PNetwork:
                         }).encode()
                     )
                     return
+
+                req, scp_signer = unwrapped
             else:
                 req = wire
 
@@ -2218,12 +2271,22 @@ class P2PNetwork:
             sig = req.get("signature", "")
             peer = self.node.peers.get(sender)
 
+            binding_ok = (
+                self._scp1_binding_matches(sender, peer, scp_signer)
+                if self.scp1_enabled
+                else True
+            )
+
             if (
                 not peer
-                or not self.node.identity.verify(
-                    req,
-                    sig,
-                    peer.public_key,
+                or not binding_ok
+                or (
+                    not self.scp1_enabled
+                    and not self.node.identity.verify(
+                        req,
+                        sig,
+                        peer.public_key,
+                    )
                 )
             ):
                 response = {
@@ -2555,6 +2618,10 @@ class QuestBoard:
 # ECONOMY
 # ============================================================
 
+class EconomyStateError(RuntimeError):
+    """Persisted economy state is unreadable or invalid."""
+
+
 @dataclass
 class Wallet:
     balance: float = 0.0; lifetime_received: float = 0.0; lifetime_spent: float = 0.0
@@ -2566,14 +2633,77 @@ class Economy:
         self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self._load()
 
     def _load(self):
-        if not self.path.exists(): return
+        if not self.path.exists():
+            return
+
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8")); w = data.get("wallet", {})
-            self.wallet = Wallet(float(w.get("balance", 0)),
-                                 float(w.get("lifetime_received", 0)),
-                                 float(w.get("lifetime_spent", 0)))
-            self.last_food = data.get("last_food_allocation"); self.escrow = data.get("escrow", {}); self.payments = data.get("payments", {})
-        except Exception: pass
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise EconomyStateError(
+                f"Cannot read economy state {self.path}: invalid JSON or I/O error"
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise EconomyStateError("Economy state must be a JSON object")
+
+        wallet_data = data.get("wallet")
+        if not isinstance(wallet_data, dict):
+            raise EconomyStateError("Economy state has no valid wallet object")
+
+        def nonnegative_number(value, field):
+            if isinstance(value, bool):
+                raise EconomyStateError(f"Invalid numeric field: {field}")
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise EconomyStateError(
+                    f"Invalid numeric field: {field}"
+                ) from exc
+            if not __import__("math").isfinite(number) or number < 0:
+                raise EconomyStateError(
+                    f"Out-of-range numeric field: {field}"
+                )
+            return number
+
+        wallet = Wallet(
+            nonnegative_number(wallet_data.get("balance", 0), "wallet.balance"),
+            nonnegative_number(
+                wallet_data.get("lifetime_received", 0),
+                "wallet.lifetime_received",
+            ),
+            nonnegative_number(
+                wallet_data.get("lifetime_spent", 0),
+                "wallet.lifetime_spent",
+            ),
+        )
+
+        currency = data.get("currency", CURRENCY)
+        if currency != CURRENCY:
+            raise EconomyStateError(
+                f"Unexpected economy currency: {currency!r}"
+            )
+
+        escrow = data.get("escrow", {})
+        payments = data.get("payments", {})
+        if not isinstance(escrow, dict):
+            raise EconomyStateError("Economy escrow must be an object")
+        if not isinstance(payments, dict):
+            raise EconomyStateError("Economy payments must be an object")
+
+        for name, records in (("escrow", escrow), ("payments", payments)):
+            for key, record in records.items():
+                if not isinstance(key, str) or not isinstance(record, dict):
+                    raise EconomyStateError(f"Invalid {name} record")
+
+        last_food = data.get("last_food_allocation")
+        if last_food is not None and not isinstance(last_food, str):
+            raise EconomyStateError("Invalid last_food_allocation")
+
+        # Publish state only after all fields pass validation.
+        self.wallet = wallet
+        self.last_food = last_food
+        self.escrow = escrow
+        self.payments = payments
 
     def _save(self):
         atomic_write(self.path, json.dumps({
@@ -2805,6 +2935,15 @@ class Economy:
 
             quest_id = str(quest_id)
             if not quest_id:
+                return False
+
+            # Reject payments if the event journal cannot be verified.
+            try:
+                journal_valid, _ = self.journal.verify()
+            except Exception:
+                return False
+
+            if not journal_valid:
                 return False
 
             # Worker-side source of truth:
@@ -3058,6 +3197,50 @@ class Symbiont:
     def __init__(self, root=ROOT_DIR):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
         self.journal = EventJournal(self.root / "events.log")
+
+        # SSS stores evidence; SIS anchors it. Neither authorizes actions.
+        self.immune_memory = None
+        self.immune_memory_error = None
+        self.sis_integrity = None
+        self.sis_integrity_error = None
+
+        if ImmuneMemory is not None:
+            try:
+                self.immune_memory = ImmuneMemory(
+                    self.root / "immune_memory.sqlite3"
+                )
+
+                if SISIntegrity is not None:
+                    try:
+                        self.sis_integrity = SISIntegrity(
+                            self.root / "sis_integrity"
+                        )
+                    except Exception as exc:
+                        self.sis_integrity_error = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+
+                self.journal.add_listener(
+                    self._record_immune_evidence,
+                    replay_existing=True,
+                )
+            except Exception as exc:
+                self.immune_memory_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if self.sis_integrity is not None:
+                    try:
+                        self.sis_integrity.close()
+                    except Exception:
+                        pass
+                self.sis_integrity = None
+                if self.immune_memory is not None:
+                    try:
+                        self.immune_memory.close()
+                    except Exception:
+                        pass
+                self.immune_memory = None
+
         self.identity = Identity(self.root / "identity.json")
 
         self.continuity_shadow = None
@@ -3322,8 +3505,156 @@ class Symbiont:
         return self.memory.remember(text=text, kind=kind, importance=importance,
                                     tags=tags, source="human")
 
+    def _record_immune_evidence(self, event):
+        """Persist security, economy and quest events as factual evidence."""
+        event_type = str(event.get("type", ""))
+        if not event_type.startswith(("security.", "economy.", "quest.", "tsk.")):
+            return
+        if self.immune_memory is None:
+            return
+
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+
+        try:
+            event_id = str(event["event_id"])
+            incident_id = (
+                payload.get("incident_id")
+                or payload.get("quest_id")
+                or event_id
+            )
+            domain = event_type.split(".", 1)[0]
+            evidence_id = self.immune_memory.record_evidence(
+                source_event_id=event_id,
+                source_event_type=event_type,
+                source_event_hash=str(event["hash"]),
+                evidence_kind="fact",
+                summary=f"Observed Core {domain} event: {event_type}",
+                incident_id=str(incident_id),
+                details={
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+            )
+            self.immune_memory_error = None
+
+            if self.sis_integrity is not None:
+                try:
+                    evidence = next(
+                        (
+                            item
+                            for item in self.immune_memory.list_evidence(
+                                incident_id=str(incident_id)
+                            )
+                            if item["evidence_id"] == evidence_id
+                        ),
+                        None,
+                    )
+                    if evidence is None:
+                        raise RuntimeError(
+                            "Recorded Immune Memory evidence could not be retrieved"
+                        )
+                    self.sis_integrity.anchor_evidence(evidence)
+                    self.sis_integrity_error = None
+                except Exception as exc:
+                    self.sis_integrity_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        except Exception as exc:
+            # EventJournal isolates observer failures; expose them on Core.
+            self.immune_memory_error = f"{type(exc).__name__}: {exc}"
+
     def status(self):
         valid, events = self.journal.verify()
+        journal_status = {"valid": valid, "events": events}
+
+        immune_memory_status = {
+            "enabled": self.immune_memory is not None,
+            "verified": None,
+            "evidence_count": None,
+            "error": self.immune_memory_error,
+        }
+        if self.immune_memory is not None:
+            try:
+                immune_valid, immune_count = self.immune_memory.verify()
+                immune_memory_status["verified"] = bool(immune_valid)
+                immune_memory_status["evidence_count"] = immune_count
+            except Exception as exc:
+                immune_memory_status["error"] = (
+                    immune_memory_status["error"]
+                    or f"verify failed: {type(exc).__name__}"
+                )
+
+        if self.sis_integrity is not None:
+            try:
+                sis_integrity_status = dict(self.sis_integrity.status())
+                sis_integrity_status["enabled"] = True
+                sis_integrity_status["error"] = self.sis_integrity_error
+            except Exception as exc:
+                sis_integrity_status = {
+                    "enabled": True,
+                    "valid": False,
+                    "anchored_records": None,
+                    "error": (
+                        self.sis_integrity_error
+                        or f"status failed: {type(exc).__name__}"
+                    ),
+                }
+        else:
+            sis_integrity_status = {
+                "enabled": False,
+                "valid": None,
+                "anchored_records": None,
+                "error": self.sis_integrity_error,
+            }
+
+        immune_count = immune_memory_status["evidence_count"]
+        anchored_count = sis_integrity_status.get("anchored_records")
+        count_mismatch = (
+            immune_count != anchored_count
+            if (
+                immune_memory_status["enabled"]
+                and sis_integrity_status["enabled"]
+                and isinstance(immune_count, int)
+                and isinstance(anchored_count, int)
+            )
+            else None
+        )
+
+        component_errors = bool(
+            immune_memory_status["error"] or sis_integrity_status["error"]
+        )
+        integrity_failure = (
+            not valid
+            or immune_memory_status["verified"] is False
+            or sis_integrity_status.get("valid") is False
+            or count_mismatch is True
+        )
+
+        if integrity_failure:
+            sss_state = "degraded"
+        elif not immune_memory_status["enabled"] and not sis_integrity_status["enabled"]:
+            sss_state = "unavailable" if component_errors else "disabled"
+        elif (
+            component_errors
+            or not immune_memory_status["enabled"]
+            or not sis_integrity_status["enabled"]
+            or immune_memory_status["verified"] is not True
+            or sis_integrity_status.get("valid") is not True
+        ):
+            sss_state = "degraded"
+        else:
+            sss_state = "healthy"
+
+        sss_status = {
+            "state": sss_state,
+            "journal": journal_status,
+            "immune_memory": immune_memory_status,
+            "sis_integrity": sis_integrity_status,
+            "evidence_count_mismatch": count_mismatch,
+        }
+
         return {
             "core": CORE_VERSION,
             "symbiont_id": self.identity.id(),
@@ -3350,7 +3681,10 @@ class Symbiont:
                 } if self.smsa is not None else {},
             },
             "economy": self.economy.snapshot(),
-            "journal": {"valid": valid, "events": events},
+            "journal": journal_status,
+            "immune_memory": immune_memory_status,
+            "sis_integrity": sis_integrity_status,
+            "sss": sss_status,
             "continuity": (
                 self.continuity_shadow.status()
                 if self.continuity_shadow
@@ -3364,6 +3698,10 @@ class Symbiont:
     def close(self):
         self.listener.stop(); self.p2p.stop()
         self.journal.append("symbiont.shutdown", {"id": self.identity.id()})
+        if self.sis_integrity is not None:
+            self.sis_integrity.close()
+        if self.immune_memory is not None:
+            self.immune_memory.close()
         self.memory.close()
 
 

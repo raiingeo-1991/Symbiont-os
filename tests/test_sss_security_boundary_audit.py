@@ -90,7 +90,7 @@ class FakeNode:
         self.peers = core.PeerDirectory()
 
 
-def test_incoming_scp1_does_not_bind_sender_to_signing_node(
+def test_incoming_scp1_rejects_sender_signer_mismatch(
     tmp_path, monkeypatch
 ):
     signer = NodeIdentity(tmp_path / "signer.json")
@@ -145,4 +145,4 @@ def test_incoming_scp1_does_not_bind_sender_to_signing_node(
 
     assert connection.sent is not None
     response = json.loads(connection.sent.decode("utf-8"))
-    assert response.get("test_response", {}).get("status") == "PONG"
+    assert response.get("test_response", {}).get("status") == "UNAUTHORIZED"
