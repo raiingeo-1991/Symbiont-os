@@ -47,3 +47,17 @@ core/*.zerotrust-pre-scp1.py
 # Historical Core variants
 symbiont_core.escrow-*.py
 core/scp1_zerotrust.v1-final.py
+
+# Private local runtime state — never publish
+ROOT_PATH/
+.r28r6_audit/
+.r28r35_runtime/
+.identity-tsk-backup-*/
+
+# Local pre-patch snapshots
+*.pre-*
+symbiont_core.py.step44-prepatch
+
+# Local historical archive and Python caches
+archive/
+__pycache__/
