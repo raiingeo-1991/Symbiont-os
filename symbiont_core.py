@@ -3014,7 +3014,7 @@ class Economy:
                 "worker_node": worker_node,
                 "amount": execution_reward,
                 "currency": CURRENCY,
-                "received_at": datetime.utcnow().isoformat() + "Z",
+                "received_at": datetime.now(timezone.utc).isoformat(),
             }
 
             self.wallet.balance += execution_reward
@@ -3194,7 +3194,7 @@ class ContextBus:
 # ============================================================
 
 class Symbiont:
-    def __init__(self, root=ROOT_DIR):
+    def __init__(self, root=ROOT_DIR, show_recovery_phrase=True):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
         self.journal = EventJournal(self.root / "events.log")
 
@@ -3405,7 +3405,7 @@ class Symbiont:
         self.started_at = now_iso()
         self.journal.append("symbiont.initialized",
                             {"version": CORE_VERSION, "id": self.identity.id()})
-        if self.identity.recovery_phrase:
+        if show_recovery_phrase and self.identity.recovery_phrase:
             print("\n" + "!" * 60)
             print("  ЗАПИШИ RECOVERY PHRASE (больше не покажется):")
             print(f"  {self.identity.recovery_phrase}")
@@ -4109,7 +4109,7 @@ def self_test():
     assert BODY is not None, "Body module failed to load"
     assert BODY.is_available() is True
     with tempfile.TemporaryDirectory() as temporary:
-        sym = Symbiont(Path(temporary))
+        sym = Symbiont(Path(temporary), show_recovery_phrase=False)
         assert sym.identity.id().startswith("sym-")
         mem_id = sym.remember("Symbiont сохраняет непрерывность.",
                               kind="principle", importance=10, tags=["memory"])

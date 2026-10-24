@@ -734,7 +734,10 @@ The canonical Symbiont line currently contains a working integrated foundation:
 - background and proactive processing;
 - optional SCA-1 Continuity Shadow;
 - XLink adapter;
-- automated integration and regression tests.
+- SSS immune-memory module (`core/sss/immune_memory.py`);
+- SIS integrity module (`core/sss/sis_integrity.py`);
+- SIS anchor ledger (`core/sss/sis_anchor_ledger.py`);
+- automated integration and regression tests, including SSS/SIS and identity-binding coverage.
 
 The verified integration path is:
 
@@ -749,7 +752,7 @@ New architectural layers should not be introduced unless the existing system req
 The canonical local directory is:
 
 ```text
-~/Symbiont-os
+~/Symbiont-Continuum
 ```
 
 ---

@@ -5,26 +5,26 @@
 Canonical-директория:
 
 ```bash
-cd ~/Symbiont-os
+cd ~/Symbiont-Continuum
 ```
 
 ## 1. Проверка canonical-директории
 
 ```bash
-cd ~/Symbiont-os
+cd ~/Symbiont-Continuum
 pwd
 ```
 
 Ожидаемый путь в Termux:
 
-`/data/data/com.termux/files/home/Symbiont-os`
+`/data/data/com.termux/files/home/Symbiont-Continuum`
 
 Это текущая локальная source-of-truth линия проекта.
 
 ## 2. Запуск Symbiont
 
 ```bash
-cd ~/Symbiont-os
+cd ~/Symbiont-Continuum
 python symbiont_core.py
 ```
 
@@ -94,7 +94,7 @@ SMSA добавляет security/authorization boundary для поддержи�
 Из canonical-директории:
 
 ```bash
-cd ~/Symbiont-os
+cd ~/Symbiont-Continuum
 python -m pytest -q tests
 ```
 
@@ -167,7 +167,7 @@ Symbiont остаётся экспериментальным проектом, �
 
 Текущая canonical-линия:
 
-`~/Symbiont-os`
+`~/Symbiont-Continuum`
 
 Не публикуйте секреты, приватные ключи, recovery-фразы или другие чувствительные данные.
 

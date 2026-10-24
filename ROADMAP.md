@@ -73,7 +73,7 @@ SCA-1 работает как опциональный Shadow-контур:
 
 Последний подтверждённый полный прогон тестов:
 
-**92 tests passed.**
+**Local Termux verification (2026-10-24): 248 tests passed** using `python -m pytest -q`; `python symbiont_core.py --test` also passed. GitHub Actions has not yet been rerun for the local changes.
 
 ---
 
@@ -265,7 +265,7 @@ Controlled Evolution
 
 Canonical source-of-truth:
 
-`~/Symbiont-os`
+`~/Symbiont-Continuum`
 
 Статус проекта: experimental / actively developed.
 

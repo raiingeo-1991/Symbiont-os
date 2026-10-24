@@ -187,7 +187,7 @@ The current development priority is:
 
 Large new architectural layers are not added without a demonstrated need.
 
-The current full test suite contains **92 tests**.
+Local Termux verification on 2026-10-24: **248 tests passed** with `python -m pytest -q`. The built-in self-test also passed. GitHub Actions has not yet been rerun for the local changes.
 
 ---
 
@@ -196,7 +196,7 @@ The current full test suite contains **92 tests**.
 From the canonical project directory:
 
 ```bash
-cd ~/Symbiont-os
+cd ~/Symbiont-Continuum
 python symbiont_core.py
 ```
 
@@ -244,7 +244,7 @@ This project is experimental. Components and interfaces may change as testing co
 
 The canonical local development line is:
 
-`~/Symbiont-os`
+`~/Symbiont-Continuum`
 
 Do not treat archived or legacy copies as the active development line.
 

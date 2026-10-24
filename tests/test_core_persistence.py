@@ -23,6 +23,28 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(restored.secret_key(), original.secret_key())
 
 
+    def test_recovery_phrase_is_suppressed_when_requested(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                sym = Symbiont(
+                    Path(temporary),
+                    show_recovery_phrase=False,
+                )
+            try:
+                self.assertIsNotNone(sym.identity.recovery_phrase)
+                self.assertNotIn(
+                    "ЗАПИШИ RECOVERY PHRASE",
+                    output.getvalue(),
+                )
+                self.assertNotIn(
+                    sym.identity.recovery_phrase,
+                    output.getvalue(),
+                )
+            finally:
+                sym.close()
+
+
 class PersistenceTests(unittest.TestCase):
     def test_memory_and_identity_survive_restart_without_llm(self):
         with tempfile.TemporaryDirectory() as temporary:
