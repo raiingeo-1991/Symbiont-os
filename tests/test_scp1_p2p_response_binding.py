@@ -1,9 +1,11 @@
+import hashlib
 import json
 
 import symbiont_core as core
 from core.node_identity import NodeIdentity
 from core.crypto_protocol import SCP1, SCPReplayGuard
 from core.scp1_zerotrust import SCP1ZeroTrust
+from tsk import TrustedSecurityKernel
 
 
 class FakeCoreIdentity:
@@ -44,6 +46,7 @@ class FakeNode:
     def __init__(self):
         self.identity = FakeCoreIdentity()
         self.peers = core.PeerDirectory()
+        self.tsk = None
 
 
 def make_scp_packet(identity, payload, nonce):
@@ -58,66 +61,125 @@ def make_scp_packet(identity, payload, nonce):
     return SCP1.sign(identity.private_key, packet)
 
 
-def test_send_to_does_not_bind_response_to_expected_peer(
+def make_network(tmp_path, monkeypatch, response, expected_node,
+                 core_id, core_public_key, trusted_nodes,
+                 *, bind=True, bound_core_key=None, nonce="response-nonce"):
+    local = NodeIdentity(tmp_path / "local.json")
+    node = FakeNode()
+    node.peers.upsert(
+        core_id, core_public_key, "127.0.0.1", 12345
+    )
+
+    tsk_root = tmp_path / "tsk"
+    node.tsk = TrustedSecurityKernel(root=tsk_root)
+
+    if bind:
+        bound_key = (
+            core_public_key if bound_core_key is None else bound_core_key
+        )
+        core_fp = hashlib.sha256(bound_key.encode("utf-8")).hexdigest()
+        node_path = tmp_path / "expected-node.json"
+        # Use the same persisted NodeIdentity that the binding confirms.
+        expected_node_path = expected_node.path
+        node.tsk.confirm_core_node_binding(
+            core_id=core_id,
+            core_public_key_fingerprint=core_fp,
+            node_identity_path=expected_node_path,
+            owner_confirmation=f"BIND {core_id} TO NODE {expected_node.node_id}",
+        )
+        # Exercise persisted binding state, not just the original instance.
+        node.tsk = TrustedSecurityKernel(root=tsk_root)
+
+    network = core.P2PNetwork(node, scp_identity=local)
+    network.scp1_enabled = True
+    network.scp1 = SCP1ZeroTrust(
+        trusted_nodes=trusted_nodes,
+        replay_guard=SCPReplayGuard(tmp_path / "replay.json"),
+    )
+
+    fake_socket = FakeSocket(response)
+    monkeypatch.setattr(
+        core.socket, "socket", lambda *a, **kw: fake_socket
+    )
+    return network, core_id
+
+
+def test_send_to_accepts_owner_confirmed_core_node_binding(
+    tmp_path, monkeypatch
+):
+    expected_path = tmp_path / "expected.json"
+    expected = NodeIdentity(expected_path)
+    core_id = "core-expected"
+    core_key = "expected-core-public-key"
+    payload = {"status": "OK", "from": expected.node_id}
+    response = {"scp1": make_scp_packet(expected, payload, "nonce-valid")}
+
+    network, peer_id = make_network(
+        tmp_path, monkeypatch, response, expected,
+        core_id, core_key, [expected.node_id],
+    )
+
+    assert peer_id == core_id
+    assert network.send_to(peer_id, {"action": "TEST"}) == payload
+
+
+def test_send_to_rejects_another_trusted_node(
     tmp_path, monkeypatch
 ):
     expected = NodeIdentity(tmp_path / "expected.json")
     other = NodeIdentity(tmp_path / "other.json")
-    local = NodeIdentity(tmp_path / "local.json")
+    core_id = "core-expected"
+    core_key = "expected-core-public-key"
+    response = {
+        "scp1": make_scp_packet(
+            other, {"status": "FORGED"}, "nonce-wrong-node"
+        )
+    }
 
-    node = FakeNode()
-    node.peers.upsert(
-        expected.node_id, "unused-core-key", "127.0.0.1", 12345
+    network, peer_id = make_network(
+        tmp_path, monkeypatch, response, expected,
+        core_id, core_key, [expected.node_id, other.node_id],
     )
 
-    network = core.P2PNetwork(node, scp_identity=local)
-    network.scp1_enabled = True
-    network.scp1 = SCP1ZeroTrust(
-        trusted_nodes=[expected.node_id, other.node_id],
-        replay_guard=SCPReplayGuard(tmp_path / "replay.json"),
-    )
+    assert network.send_to(peer_id, {"action": "TEST"}) is None
 
-    response_packet = make_scp_packet(
-        other,
-        {"status": "OK", "from": other.node_id},
-        "response-nonce-other",
-    )
-    fake_socket = FakeSocket({"scp1": response_packet})
-    monkeypatch.setattr(
-        core.socket, "socket", lambda *a, **kw: fake_socket
-    )
 
-    result = network.send_to(expected.node_id, {"action": "TEST"})
-
-    # Expected security behavior: reject a response from the wrong node.
-    assert result is None
-
-def test_send_to_accepts_response_from_expected_peer(
+def test_send_to_rejects_missing_owner_confirmed_binding(
     tmp_path, monkeypatch
 ):
-    expected = NodeIdentity(tmp_path / "expected-positive.json")
-    local = NodeIdentity(tmp_path / "local-positive.json")
+    expected = NodeIdentity(tmp_path / "expected.json")
+    core_id = "core-without-binding"
+    core_key = "expected-core-public-key"
+    response = {
+        "scp1": make_scp_packet(
+            expected, {"status": "OK"}, "nonce-no-binding"
+        )
+    }
 
-    node = FakeNode()
-    node.peers.upsert(
-        expected.node_id, "unused-core-key", "127.0.0.1", 12345
+    network, peer_id = make_network(
+        tmp_path, monkeypatch, response, expected,
+        core_id, core_key, [expected.node_id], bind=False,
     )
 
-    network = core.P2PNetwork(node, scp_identity=local)
-    network.scp1_enabled = True
-    network.scp1 = SCP1ZeroTrust(
-        trusted_nodes=[expected.node_id],
-        replay_guard=SCPReplayGuard(tmp_path / "replay-positive.json"),
+    assert network.send_to(peer_id, {"action": "TEST"}) is None
+
+
+def test_send_to_rejects_mismatched_core_key_fingerprint(
+    tmp_path, monkeypatch
+):
+    expected = NodeIdentity(tmp_path / "expected.json")
+    core_id = "core-wrong-fingerprint"
+    core_key = "expected-core-public-key"
+    response = {
+        "scp1": make_scp_packet(
+            expected, {"status": "OK"}, "nonce-wrong-fingerprint"
+        )
+    }
+
+    network, peer_id = make_network(
+        tmp_path, monkeypatch, response, expected,
+        core_id, core_key, [expected.node_id],
+        bound_core_key="different-core-public-key",
     )
 
-    payload = {"status": "OK", "from": expected.node_id}
-    response_packet = make_scp_packet(
-        expected, payload, "response-nonce-expected-positive"
-    )
-    fake_socket = FakeSocket({"scp1": response_packet})
-    monkeypatch.setattr(
-        core.socket, "socket", lambda *a, **kw: fake_socket
-    )
-
-    result = network.send_to(expected.node_id, {"action": "TEST"})
-    assert result == payload
+    assert network.send_to(peer_id, {"action": "TEST"}) is None

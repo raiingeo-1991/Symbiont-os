@@ -255,6 +255,25 @@ class AnchorLedger:
         with self.lock, _exclusive_file_lock(self.lock_path):
             return self._verify_or_raise_unlocked()
 
+    def head_anchor(self):
+        """Return the verified chain head as a SIS Witness Anchor."""
+        from core.sss.sis_witness import Anchor, ZERO_HASH as WITNESS_ZERO_HASH
+
+        with self.lock, _exclusive_file_lock(self.lock_path):
+            count = self._verify_or_raise_unlocked()
+            row = self.db.execute(
+                "SELECT sequence, record_hash FROM evidence "
+                "ORDER BY sequence DESC LIMIT 1"
+            ).fetchone()
+
+            if row is None:
+                return Anchor(0, WITNESS_ZERO_HASH)
+
+            if row["sequence"] != count:
+                raise IntegrityError("Ledger head sequence mismatch")
+
+            return Anchor(row["sequence"], row["record_hash"])
+
     def append(self, event_id: str, summary: str) -> str:
         with self.lock, _exclusive_file_lock(self.lock_path):
             event_id = str(event_id).strip()

@@ -45,6 +45,11 @@ except Exception:
     SISIntegrity = None
 
 try:
+    from experiments.active_immunity.immune_cycle import ImmuneCycle
+except Exception:
+    ImmuneCycle = None
+
+try:
     from core.security import SMSA, get_secure_settlement
 except Exception:
     SMSA = None
@@ -2454,7 +2459,22 @@ class P2PNetwork:
             )
 
             if self.scp1_enabled:
-                return self._scp1_unwrap(response, expected_peer_id=peer_id)
+                unwrapped = self._scp1_unwrap(
+                    response,
+                    return_identity=True,
+                )
+                if unwrapped is None:
+                    return None
+
+                response_payload, signer = unwrapped
+                if not self._scp1_binding_matches(
+                    peer_id,
+                    peer,
+                    signer,
+                ):
+                    return None
+
+                return response_payload
 
             return response
 
@@ -3565,6 +3585,130 @@ class Symbiont:
             # EventJournal isolates observer failures; expose them on Core.
             self.immune_memory_error = f"{type(exc).__name__}: {exc}"
 
+    def run_immunity_scan(self):
+        """Run a controlled scan; never apply source patches."""
+        from datetime import datetime, timezone
+        import hashlib
+        import json
+
+        report = {
+            "ok": False,
+            "mode": "read_only_discovery_and_isolated_reproduction",
+            "patches_applied": False,
+            "memory_recorded": False,
+            "sis_anchored": False,
+            "errors": [],
+        }
+
+        if ImmuneCycle is None:
+            report["errors"].append("ImmuneCycle import unavailable")
+            return report
+
+        project_root = Path(__file__).resolve().parent
+        cycle = ImmuneCycle(project_root, self.root / "immune_reports")
+        try:
+            discovery = cycle.discover_economy_write_order()
+            report["discovery"] = discovery
+            report["reproduction"] = None
+            report["evidence_id"] = None
+
+            finding = next(
+                (
+                    item for item in discovery.get("findings", [])
+                    if item.get("method") == "credit"
+                    and item.get("rule_id") == "ECONOMY-SAVE-BEFORE-JOURNAL"
+                ),
+                None,
+            )
+            if finding is not None:
+                finding = dict(finding)
+                finding["source_sha256"] = discovery.get("source_sha256", "")
+
+            if finding is None:
+                report["result"] = "no_matching_candidate_found"
+            else:
+                reproduction = cycle.reproduce_credit_journal_failure()
+                report["reproduction"] = reproduction
+
+                if reproduction.get("confirmed") is True:
+                    if self.immune_memory is None:
+                        report["errors"].append("ImmuneMemory unavailable")
+                    else:
+                        evidence_id = cycle.record_reproduction(
+                            self.immune_memory, finding, reproduction
+                        )
+                        report["evidence_id"] = evidence_id
+                        report["memory_recorded"] = True
+
+                        reproduction_json = json.dumps(
+                            reproduction, sort_keys=True,
+                            ensure_ascii=False, default=str,
+                        )
+                        incident_digest = hashlib.sha256(
+                            (
+                                str(finding["source_sha256"]) + "|"
+                                + str(finding["rule_id"]) + "|"
+                                + str(finding["method"]) + "|"
+                                + reproduction_json
+                            ).encode("utf-8")
+                        ).hexdigest()
+
+                        if self.sis_integrity is not None:
+                            try:
+                                evidence = next(
+                                    (
+                                        item for item in
+                                        self.immune_memory.list_evidence(
+                                            incident_id=incident_digest
+                                        )
+                                        if item.get("evidence_id") == evidence_id
+                                    ),
+                                    None,
+                                )
+                                if evidence is None:
+                                    raise RuntimeError(
+                                        "Recorded evidence could not be retrieved"
+                                    )
+                                self.sis_integrity.anchor_evidence(evidence)
+                                self.sis_integrity_error = None
+                                report["sis_anchored"] = True
+                            except Exception as exc:
+                                self.sis_integrity_error = (
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+                                report["errors"].append(
+                                    "SIS anchor failed: "
+                                    + self.sis_integrity_error
+                                )
+                        else:
+                            report["errors"].append("SISIntegrity unavailable")
+
+                    report["result"] = "reproduction_confirmed"
+                else:
+                    report["result"] = "reproduction_not_confirmed"
+
+            report["ok"] = (
+                report.get("result") == "reproduction_confirmed"
+                and report["memory_recorded"]
+                and report["sis_anchored"]
+                and not report["errors"]
+            )
+        except Exception as exc:
+            report["errors"].append(f"{type(exc).__name__}: {exc}")
+
+        try:
+            report_path = cycle.save_report(report)
+            report["report_path"] = str(report_path)
+        except Exception as exc:
+            report["errors"].append(
+                f"Report save failed: {type(exc).__name__}: {exc}"
+            )
+            report["ok"] = False
+
+        if report["errors"]:
+            report["ok"] = False
+        return report
+
     def status(self):
         valid, events = self.journal.verify()
         journal_status = {"valid": valid, "events": events}
@@ -3768,6 +3912,17 @@ class Shell:
         if cmd == "help": self.help(); return True
         if cmd == "status":
             print(json.dumps(self.sym.status(), ensure_ascii=False, indent=2)); return True
+
+        if cmd == "immunity":
+            if arg.strip().lower() != "scan":
+                print("Usage: immunity scan")
+                return True
+            print(json.dumps(
+                self.sym.run_immunity_scan(),
+                ensure_ascii=False,
+                indent=2,
+            ))
+            return True
 
         if cmd == "say":
             if not arg: print("Usage: say <text>"); return True
@@ -4085,6 +4240,7 @@ class Shell:
   sync — snapshot памяти
   restore <12 слов>
   llm status|on|off|models
+  immunity scan       — сканирование активной защиты
   food / balance / status / verify / exit
 """)
 
