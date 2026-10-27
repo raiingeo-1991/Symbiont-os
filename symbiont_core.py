@@ -2650,7 +2650,7 @@ class Wallet:
 class Economy:
     def __init__(self, path, journal):
         self.path = path; self.journal = journal; self.lock = threading.RLock()
-        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self._load()
+        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self.mint_operations = {}; self._load()
 
     def _load(self):
         if not self.path.exists():
@@ -2705,12 +2705,19 @@ class Economy:
 
         escrow = data.get("escrow", {})
         payments = data.get("payments", {})
+        mint_operations = data.get("mint_operations", {})
         if not isinstance(escrow, dict):
             raise EconomyStateError("Economy escrow must be an object")
         if not isinstance(payments, dict):
             raise EconomyStateError("Economy payments must be an object")
+        if not isinstance(mint_operations, dict):
+            raise EconomyStateError("Economy mint_operations must be an object")
 
-        for name, records in (("escrow", escrow), ("payments", payments)):
+        for name, records in (
+            ("escrow", escrow),
+            ("payments", payments),
+            ("mint_operations", mint_operations),
+        ):
             for key, record in records.items():
                 if not isinstance(key, str) or not isinstance(record, dict):
                     raise EconomyStateError(f"Invalid {name} record")
@@ -2724,13 +2731,15 @@ class Economy:
         self.last_food = last_food
         self.escrow = escrow
         self.payments = payments
+        self.mint_operations = mint_operations
 
     def _save(self):
         atomic_write(self.path, json.dumps({
             "wallet": asdict(self.wallet),
             "last_food_allocation": self.last_food,
             "currency": CURRENCY,
-            "escrow": self.escrow, "payments": self.payments}, ensure_ascii=False, indent=2))
+            "escrow": self.escrow, "payments": self.payments,
+            "mint_operations": self.mint_operations}, ensure_ascii=False, indent=2))
 
     def credit(self, amount, reason):
         amount = float(amount)

@@ -187,7 +187,7 @@ The current development priority is:
 
 Large new architectural layers are not added without a demonstrated need.
 
-Local Termux verification on 2026-10-24: **248 tests passed** with `python -m pytest -q`. The built-in self-test also passed. GitHub Actions has not yet been rerun for the local changes.
+GitHub Actions verification for commit `e501fb9705ae7fa2d69229970f032ec7041eac7c` on 2026-10-25: **293 tests passed on Python 3.10 and 293 tests passed on Python 3.12** using `python -m pytest -q`. The built-in self-test (`python symbiont_core.py --test`) also passed on both versions. This CI result is separate from local Termux verification.
 
 ---
 

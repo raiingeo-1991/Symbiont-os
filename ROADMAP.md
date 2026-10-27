@@ -73,7 +73,7 @@ SCA-1 работает как опциональный Shadow-контур:
 
 Последний подтверждённый полный прогон тестов:
 
-**Local Termux verification (2026-10-24): 248 tests passed** using `python -m pytest -q`; `python symbiont_core.py --test` also passed. GitHub Actions has not yet been rerun for the local changes.
+**GitHub Actions verification (2026-10-25, commit `e501fb9705ae7fa2d69229970f032ec7041eac7c`):** `python -m pytest -q` passed **293 tests on Python 3.10 and 293 tests on Python 3.12**. `python symbiont_core.py --test` also passed on both versions. These CI results do not replace a separate test run on Android/Termux.
 
 ---
 

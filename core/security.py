@@ -1,3 +1,4 @@
+import math
 import os
 import json
 import time
@@ -773,7 +774,8 @@ class GenesisMint:
     """
     Controlled SYM issuance for genesis/test environments.
 
-    Minting is separate from normal payment execution.
+    Mint operations are persisted with the economy state so that retries
+    cannot issue the same mint_id twice after a restart.
     """
 
     CAPABILITY = "economy.mint"
@@ -781,50 +783,64 @@ class GenesisMint:
     def __init__(self, economy, security=None):
         self.economy = economy
         self.security = security or get_security()
-        self._minted = set()
         self._lock = threading.RLock()
 
     def mint(self, amount, recipient="owner", mint_id=None):
         self.security.capabilities.require(self.CAPABILITY)
 
         amount = float(amount)
-
-        if amount <= 0:
+        if not math.isfinite(amount) or amount <= 0:
             return False
 
-        mint_id = str(
-            mint_id or secrets.token_hex(16)
-        )
+        mint_id = str(mint_id or secrets.token_hex(16))
+        recipient = str(recipient)
 
-        with self._lock:
-            if mint_id in self._minted:
+        with self._lock, self.economy.lock:
+            operations = self.economy.mint_operations
+
+            if mint_id in operations:
                 return False
+
+            old_balance = self.economy.wallet.balance
+            old_received = self.economy.wallet.lifetime_received
 
             self.economy.wallet.balance += amount
             self.economy.wallet.lifetime_received += amount
-            self.economy._save()
+            operations[mint_id] = {
+                "mint_id": mint_id,
+                "amount": amount,
+                "recipient": recipient,
+                "status": "committed",
+            }
 
-            self._minted.add(mint_id)
+            try:
+                # Balance and operation ID are persisted in one state write.
+                self.economy._save()
+            except Exception:
+                self.economy.wallet.balance = old_balance
+                self.economy.wallet.lifetime_received = old_received
+                operations.pop(mint_id, None)
+                raise
 
+            # Audit failure must not undo or duplicate a committed mint.
             self.security.audit.record(
                 "economy.mint",
                 mint_id=mint_id,
                 amount=amount,
-                recipient=str(recipient),
+                recipient=recipient,
             )
 
             return True
 
     def status(self):
-        with self._lock:
+        with self._lock, self.economy.lock:
             return {
                 "capability": self.CAPABILITY,
                 "enabled": self.security.capabilities.allowed(
                     self.CAPABILITY
                 ),
-                "operations": len(self._minted),
+                "operations": len(self.economy.mint_operations),
             }
-
 
 def get_genesis_mint(economy, security=None):
     return GenesisMint(economy, security)
