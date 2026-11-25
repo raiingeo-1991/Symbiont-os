@@ -31,12 +31,19 @@ class ContinuityShadow:
         self.path = self.root / "continuity"
         self.path.mkdir(parents=True, exist_ok=True)
 
-        self.identity = ContinuityIdentity(
-            symbiont_id=str(core_identity.id()),
-            public_key=str(core_identity.public_key()),
-            algorithm="Ed25519",
-            version="SCA-1",
-        )
+        if callable(getattr(core_identity, "identity", None)):
+            self.identity = ContinuityIdentity.from_node_identity(core_identity)
+            if self.identity.algorithm != "Ed25519":
+                raise ValueError("SCA-1 requires an Ed25519 NodeIdentity")
+        else:
+            # Compatibility for isolated legacy unit fixtures only.
+            # Core integration must pass NodeIdentity, never Core Identity/HMAC.
+            self.identity = ContinuityIdentity(
+                symbiont_id=str(core_identity.id()),
+                public_key=str(core_identity.public_key()),
+                algorithm="UNVERIFIED-LEGACY",
+                version="SCA-1",
+            )
 
         self.ledger = ContinuityLedger(self.path / "ledger.jsonl")
         self.recovery = ContinuityRecovery(
@@ -65,6 +72,56 @@ class ContinuityShadow:
             for event in self.ledger.events()
         }
         self._events_seen.discard(None)
+        self._failed = False
+        self._error_count = 0
+        self._body_manager = None
+        self._last_error = None
+        latest_core_event = next(
+            (
+                event for event in reversed(self.ledger.events())
+                if event.payload.get("core_event_id")
+            ),
+            None,
+        )
+        self._last_core_event_id = (
+            latest_core_event.payload.get("core_event_id")
+            if latest_core_event is not None else None
+        )
+
+    @property
+    def body_manager(self):
+        """Return the process-wide Body manager bound to this Shadow Ledger."""
+        if self._failed:
+            raise RuntimeError(
+                "SCA-1 Shadow is degraded; restart required before Body operations"
+            )
+        if self._body_manager is None:
+            from .handoff import BodyHandoffManager
+
+            self._body_manager = BodyHandoffManager(
+                self.ledger,
+                state=self.state,
+                state_commit=self._commit_body_state,
+            )
+        return self._body_manager
+
+    def _commit_body_state(self, state: ContinuityState) -> None:
+        if self._failed:
+            raise RuntimeError(
+                "SCA-1 Shadow is degraded; restart required"
+            )
+        try:
+            self.recovery.save(state)
+        except Exception as exc:
+            self._failed = True
+            self._error_count += 1
+            self._last_error = {
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "event_type": "BODY_STATE_COMMIT",
+            }
+            raise
+        self.state = state
 
     @staticmethod
     def _category(event_type: str) -> Optional[str]:
@@ -120,6 +177,25 @@ class ContinuityShadow:
         return {"value": repr(payload)}
 
     def on_core_event(self, event: Dict[str, Any]) -> None:
+        if self._failed:
+            raise RuntimeError(
+                "SCA-1 Shadow is degraded after a previous event-processing failure; restart required"
+            )
+
+        try:
+            self._process_core_event(event)
+        except Exception as exc:
+            self._failed = True
+            self._error_count += 1
+            self._last_error = {
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+                "event_id": str(event.get("event_id", "")),
+                "event_type": str(event.get("type", "core.event")),
+            }
+            raise
+
+    def _process_core_event(self, event: Dict[str, Any]) -> None:
         core_event_id = str(event.get("event_id", ""))
 
         if not core_event_id or core_event_id in self._events_seen:
@@ -182,7 +258,10 @@ class ContinuityShadow:
 
         self.recovery.save(next_state)
         self.state = next_state
+        if self._body_manager is not None:
+            self._body_manager.state = next_state
         self._events_seen.add(core_event_id)
+        self._last_core_event_id = core_event_id
 
     def status(self) -> Dict[str, Any]:
         return {
@@ -198,6 +277,10 @@ class ContinuityShadow:
             "p2p_version": self.state.p2p_version,
             "ledger_events": len(self.ledger.events()),
             "ledger_valid": self.ledger.tamper_check(),
+            "health": "degraded" if self._failed else "healthy",
+            "error_count": self._error_count,
+            "last_error": self._last_error,
+            "last_core_event_id": self._last_core_event_id,
             "core_mutation": False,
         }
 

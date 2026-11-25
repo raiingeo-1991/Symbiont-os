@@ -1,12 +1,14 @@
-import json
-
 import pytest
 
 import symbiont_core as core
-from core.crypto_protocol import SCP1, SCPReplayGuard
-from core.node_identity import NodeIdentity
-from core.scp1_zerotrust import SCP1ZeroTrust
 from core.security import CapabilityGate, SecureSettlement, SecurityError
+
+from test_scp1_stage1b_live_tcp import (
+    _close,
+    _live_pair,
+    _open_authenticated_client_connection,
+    _receive_live_response,
+)
 
 
 class FakeAudit:
@@ -56,93 +58,23 @@ def test_settlement_allows_explicitly_granted_payment_capability():
     assert security.audit.events[0][0] == "settlement.reserved"
 
 
-class FakeCoreIdentity:
-    def id(self):
-        return "core-local-audit"
-
-    def public_key(self):
-        return "test-public-key"
-
-    def verify(self, payload, signature, public_key):
-        # Имитирует старый Core Identity, чтобы изолированно
-        # проверить привязку SCP-1 к внутреннему sender.
-        return bool(signature) and len(signature) >= 32
-
-
-class FakeConnection:
-    def __init__(self, incoming):
-        self.incoming = incoming
-        self.sent = None
-
-    def settimeout(self, timeout):
-        pass
-
-    def recv(self, size):
-        return self.incoming
-
-    def sendall(self, data):
-        self.sent = data
-
-
-class FakeNode:
-    def __init__(self):
-        self.identity = FakeCoreIdentity()
-        self.peers = core.PeerDirectory()
-
-
-def test_incoming_scp1_rejects_sender_signer_mismatch(
-    tmp_path, monkeypatch
-):
-    signer = NodeIdentity(tmp_path / "signer.json")
-    local = NodeIdentity(tmp_path / "local.json")
-
-    node = FakeNode()
-    # Внутренний sender указывает на другой Core-узел.
-    node.peers.upsert(
-        "core-forged-sender",
-        "test-peer-key",
-        "127.0.0.1",
-        12345,
-    )
-
-    network = core.P2PNetwork(node, scp_identity=local)
-    network.scp1_enabled = True
-    network.scp1 = SCP1ZeroTrust(
-        trusted_nodes=[signer.node_id],
-        replay_guard=SCPReplayGuard(tmp_path / "replay.json"),
-    )
-
-    request = {
-        "sender": "core-forged-sender",
-        "signature": "a" * 64,
-        "action": "PING",
-    }
-    packet = SCP1.build_payload(
-        node_id=signer.node_id,
-        public_key=signer.public_key,
-        payload=request,
-        nonce="audit-inbound-mismatch",
-        capability="network.send",
-        message_type="P2P",
-    )
-    packet = SCP1.sign(signer.private_key, packet)
-
-    connection = FakeConnection(
-        json.dumps({"scp1": packet}).encode("utf-8")
-    )
-
-    # Изолируем формат ответа: нас интересует, дошёл ли запрос
-    # с несовпадающими идентичностями до обработки PING.
-    monkeypatch.setattr(
-        network,
-        "_scp1_wrap",
-        lambda payload, message_type="P2P": {
-            "test_response": payload
-        },
-    )
-
-    network._handle_tcp(connection, ("127.0.0.1", 12345))
-
-    assert connection.sent is not None
-    response = json.loads(connection.sent.decode("utf-8"))
-    assert response.get("test_response", {}).get("status") == "UNAUTHORIZED"
+def test_incoming_scp1_rejects_sender_signer_mismatch_over_live_tcp(tmp_path):
+    pair = _live_pair(tmp_path)
+    a, b, *_rest, _a_core, b_core = pair
+    conn = None
+    try:
+        conn, handshake = _open_authenticated_client_connection(pair)
+        request = {
+            "sender": "core-forged-sender",
+            "action": "PING",
+            "session_id": handshake.session_id,
+        }
+        core.P2PNetwork._send_tcp_frame(
+            conn, a._scp1_wrap(request, message_type="PING")
+        )
+        response = _receive_live_response(a, b, b_core, conn)
+        assert response.get("status") == "UNAUTHORIZED"
+    finally:
+        if conn is not None:
+            conn.close()
+        _close(pair)

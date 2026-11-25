@@ -55,11 +55,10 @@ class TestSCA1CoreHandoff(unittest.TestCase):
                     status["continuity"]["quest_version"], 1
                 )
 
-                # Use the same SCA-1 continuity ledger for Body lifecycle
-                ledger_path = root / "continuity" / "ledger.jsonl"
-                ledger = ContinuityLedger(ledger_path)
-
-                manager = BodyHandoffManager(ledger)
+                # Use the manager owned by Shadow so Core and Body operations
+                # share one in-memory Ledger instance and one persisted state.
+                shadow = sym.continuity_shadow
+                manager = shadow.body_manager
 
                 body_a = BodyIdentity.create(
                     body_type="smartphone",
@@ -104,7 +103,7 @@ class TestSCA1CoreHandoff(unittest.TestCase):
                 )
 
                 # SCA-1 ledger must remain valid after Core + Body operations
-                self.assertTrue(ledger.verify())
+                self.assertTrue(shadow.ledger.verify())
 
                 final_status = sym.status()
 

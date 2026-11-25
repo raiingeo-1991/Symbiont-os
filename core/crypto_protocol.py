@@ -1,4 +1,7 @@
 import base64
+from contextlib import contextmanager
+import fcntl
+import threading
 import hashlib
 import json
 import os
@@ -239,55 +242,109 @@ class SCP1:
 
 
 class SCPReplayGuard:
-    """Persistent nonce protection for SCP-1."""
+    """Persistent, concurrency-safe nonce protection for SCP-1."""
 
     def __init__(self, path=None, max_entries=100000, max_age=86400):
         self.max_entries = int(max_entries)
         self.max_age = int(max_age)
-        self.path = Path(
-            path or "symbiont_data/scp_replay.json"
-        )
+        if self.max_entries < 1 or self.max_age < 0:
+            raise ValueError("Invalid SCP replay limits")
+
+        self.path = Path(path or "symbiont_data/scp_replay.json")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_path = self.path.with_name(self.path.name + ".lock")
+        self._thread_lock = threading.RLock()
         self._seen = {}
-        self._load()
+
+        with self._locked():
+            self._load()
+
+    @contextmanager
+    def _locked(self):
+        """Lock this instance and all cooperating processes."""
+        with self._thread_lock:
+            fd = os.open(
+                str(self._lock_path),
+                os.O_CREAT | os.O_RDWR,
+                0o600,
+            )
+            with os.fdopen(fd, "a+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def _load(self):
+        """Load strictly; never turn damaged storage into an empty store."""
         try:
-            if not self.path.exists():
-                return
-
-            data = json.loads(
-                self.path.read_text(encoding="utf-8")
-            )
-
-            if isinstance(data, dict):
-                self._seen = {
-                    str(k): int(v)
-                    for k, v in data.items()
-                    if isinstance(v, (int, float))
-                }
-
-            self._cleanup(save=False)
-
-        except Exception:
+            raw = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             self._seen = {}
+            return
+        except OSError as exc:
+            raise RuntimeError(
+                f"SCP replay storage cannot be read: {self.path}"
+            ) from exc
+
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("replay root must be an object")
+
+            loaded = {}
+            for key, timestamp in data.items():
+                if (
+                    not isinstance(key, str)
+                    or not key
+                    or type(timestamp) is not int
+                    or timestamp < 0
+                ):
+                    raise ValueError("invalid replay entry")
+                loaded[key] = timestamp
+
+            self._seen = loaded
+            self._cleanup(save=False)
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"SCP replay storage is corrupted: {self.path}"
+            ) from exc
 
     def _save(self):
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                self._seen,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-            encoding="utf-8",
+        """Write through a unique temporary file and atomically replace."""
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{self.path.name}.",
+            suffix=".tmp",
+            dir=str(self.path.parent),
         )
-        tmp.replace(self.path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(
+                    self._seen,
+                    stream,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            os.replace(tmp_name, self.path)
+
+            dir_fd = os.open(str(self.path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+            raise
 
     def _cleanup(self, save=True):
         now = int(time.time())
         cutoff = now - self.max_age
-
         self._seen = {
             key: timestamp
             for key, timestamp in self._seen.items()
@@ -308,23 +365,33 @@ class SCPReplayGuard:
     def check_and_store(self, node_id, nonce):
         key = f"{node_id}:{nonce}"
 
-        self._cleanup(save=False)
+        with self._locked():
+            self._load()
+            previous = self._seen.copy()
 
-        if key in self._seen:
-            return False
+            if key in self._seen:
+                return False
 
-        self._seen[key] = int(time.time())
-        self._cleanup(save=True)
+            self._seen[key] = int(time.time())
+            self._cleanup(save=False)
 
-        return True
+            try:
+                self._save()
+            except BaseException:
+                self._seen = previous
+                raise
+
+            return True
 
     def contains(self, node_id, nonce):
-        self._cleanup(save=False)
-        return f"{node_id}:{nonce}" in self._seen
+        with self._locked():
+            self._load()
+            return f"{node_id}:{nonce}" in self._seen
 
     def count(self):
-        self._cleanup(save=False)
-        return len(self._seen)
+        with self._locked():
+            self._load()
+            return len(self._seen)
 
 
 def get_scp():

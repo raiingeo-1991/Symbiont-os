@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import socket
+import struct
 import sqlite3
 import threading
 import time
@@ -77,9 +78,19 @@ except Exception:
     SCP1 = None
 
 try:
+    from core.node_handshake import NodeHandshake
+except Exception:
+    NodeHandshake = None
+
+try:
     from core.scp1_zerotrust import get_scp1_zerotrust
 except Exception:
     get_scp1_zerotrust = None
+
+try:
+    from core.peer_security import get_peer_security
+except Exception:
+    get_peer_security = None
 
 try:
     from tsk import TrustedSecurityKernel, TSKError
@@ -90,11 +101,13 @@ except Exception:
 SMSA_PERMISSION_MAP = {
     "microphone": "microphone.listen",
     "camera": "camera.read",
+    "sensor_read": "sensor.read",
+    "location_read": "location.read",
     "network_send": "network.send",
     "file_write": "file.write",
     "external_ai": "external_ai.call",
     "task_execution": "task.execute",
-    # ambient_listen shares SMSA microphone.listen capability.
+    # ambient_listen is an internal Listener control, not microphone access.
 }
 try:
     import sys
@@ -234,6 +247,8 @@ class EventJournal:
         self.path = path
         self.lock = threading.RLock()
         self._listeners = []
+        self._listener_error_count = 0
+        self._last_listener_error = None
         self._last_event_hash = self._last_hash()
 
     def add_listener(self, listener, replay_existing=False):
@@ -279,9 +294,16 @@ class EventJournal:
             for listener in tuple(self._listeners):
                 try:
                     listener(event)
-                except Exception:
-                    # Shadow observers must never break Core.
-                    pass
+                except Exception as exc:
+                    # Observer failures are visible, but must never break Core.
+                    self._listener_error_count += 1
+                    self._last_listener_error = {
+                        "listener": getattr(listener, "__qualname__", type(listener).__name__),
+                        "event_id": event.get("event_id"),
+                        "event_type": event.get("type"),
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                    }
 
             return event
 
@@ -1008,7 +1030,14 @@ class CognitiveState:
 
 class Bodies:
     def __init__(self, path, default_body="phone"):
-        self.path = path; self.lock = threading.RLock(); self.data = self._load(default_body)
+        self.path = path
+        self.lock = threading.RLock()
+        self.data = self._load(default_body)
+        self._permission_check = None
+
+    def set_permission_checker(self, checker):
+        """Attach the Core permission check after PermissionGate initialization."""
+        self._permission_check = checker
 
     def _load(self, default_body):
         if self.path.exists():
@@ -1042,10 +1071,23 @@ class Bodies:
     def list(self): return dict(self.data.get("bodies", {}))
 
     def battery(self):
+        # Core-owned Bodies must not query the physical device without consent.
+        checker = self._permission_check
+        if checker is not None:
+            try:
+                if not checker("sensor_read"):
+                    return None
+            except Exception:
+                return None
+
         if BODY is not None:
-            try: return float(BODY.battery())
-            except Exception: pass
-        with self.lock: return float(self.data.get("battery", 100.0))
+            try:
+                return float(BODY.battery())
+            except Exception:
+                pass
+
+        with self.lock:
+            return float(self.data.get("battery", 100.0))
 
     def set_battery(self, level):
         with self.lock:
@@ -1920,19 +1962,22 @@ class NightWorker:
         if emo_lines: parts.append("\nЭмоции:"); parts.extend(emo_lines)
         if goals: parts.append("\nНезавершённое из сегодняшних записей:"); parts.extend(goals[:5])
 
-        if reflection_result is not None and reflection_result.candidates:
-            parts.append("\nReflection V2 — кандидаты понимания:")
-            for candidate in reflection_result.candidates[:5]:
-                method = candidate.metadata.get("method", "reflection")
-                parts.append(
-                    f"• [{method}] {candidate.content[:180]} "
-                    f"(confidence={candidate.confidence:.2f})"
-                )
-
-        if consolidation_result is not None and consolidation_result.accepted:
+        if reflection_result is not None:
+            candidate_count = len(reflection_result.candidates)
+            accepted_count = (
+                len(consolidation_result.accepted)
+                if consolidation_result is not None else 0
+            )
+            rejected_count = (
+                len(getattr(consolidation_result, "rejected", []))
+                if consolidation_result is not None else 0
+            )
             parts.append(
-                f"\nKnowledge V2 — принято кандидатов: "
-                f"{len(consolidation_result.accepted)}"
+                "\nMemory V2 — shadow-статистика: "
+                f"кандидатов={candidate_count}, "
+                f"принято проверкой={accepted_count}, "
+                f"отклонено={rejected_count}. "
+                "Содержание кандидатов не включено в долговременный отчёт."
             )
 
         llm = self.mind.llm
@@ -1958,42 +2003,88 @@ class NightWorker:
 
 class AmbientListener:
     def __init__(self, mind, memory, journal):
-        self.mind = mind; self.memory = memory; self.journal = journal
-        self.active = False; self.lock = threading.Lock()
-        self.queue = []; self._stop = False
+        self.mind = mind
+        self.memory = memory
+        self.journal = journal
+        self.active = False
+        self.lock = threading.Lock()
+        self.queue = []
+        self._stop_event = threading.Event()
+        self._thread = None
 
     def start(self):
-        with self.lock: self.active = True
+        with self.lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+
+            self._stop_event.clear()
+            self.active = True
+            self._thread = threading.Thread(
+                target=self._worker,
+                name="Symbiont-AmbientListener",
+                daemon=True,
+            )
+            self._thread.start()
+
         self.journal.append("ambient.started", {})
-        threading.Thread(target=self._worker, daemon=True).start()
+        return True
 
     def stop(self):
-        with self.lock: self.active = False
-        self.journal.append("ambient.stopped", {})
+        with self.lock:
+            was_active = self.active
+            self.active = False
+            self.queue.clear()
+            self._stop_event.set()
+            worker = self._thread
+
+        if was_active:
+            self.journal.append("ambient.stopped", {})
+
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(1.0, LISTEN_DEBOUNCE_SEC + 0.5))
+
+        return worker is None or not worker.is_alive()
 
     def is_active(self):
-        with self.lock: return self.active
+        with self.lock:
+            return self.active
 
     def feed(self, text):
         text = text.strip()
-        if len(text) < LISTEN_MIN_LENGTH: return False
+        if len(text) < LISTEN_MIN_LENGTH:
+            return False
+
         with self.lock:
-            if not self.active: return False
+            if not self.active or self._stop_event.is_set():
+                return False
             self.queue.append(text)
+
         return True
 
     def _worker(self):
-        while not self._stop:
-            time.sleep(LISTEN_DEBOUNCE_SEC)
+        while not self._stop_event.wait(LISTEN_DEBOUNCE_SEC):
             with self.lock:
-                if not self.active or not self.queue: continue
+                if not self.active or not self.queue:
+                    continue
                 text = self.queue.pop(0)
+
             self.memory.log_ambient(text)
-            markers = ["хочу", "надо", "устал", "работа", "вода", "проблем", "помощь", "план"]
-            if any(m in text.lower() for m in markers):
-                mem_id = self.memory.remember(text, kind="ambient", importance=4, source="mic")
+            markers = [
+                "хочу", "надо", "устал", "работа",
+                "вода", "проблем", "помощь", "план",
+            ]
+            if any(marker in text.lower() for marker in markers):
+                mem_id = self.memory.remember(
+                    text,
+                    kind="ambient",
+                    importance=4,
+                    source="mic",
+                )
                 self.mind.build_links(mem_id, text)
-                self.journal.append("ambient.captured", {"text": text[:200]})
+                self.journal.append(
+                    "ambient.captured",
+                    {"text": text[:200]},
+                )
 
 
 # ============================================================
@@ -2002,18 +2093,47 @@ class AmbientListener:
 
 @dataclass
 class Peer:
-    peer_id: str; public_key: str; address: str; tcp_port: int
-    last_seen: float; name: str = "?"; role: str = "?"
+    peer_id: str
+    public_key: str
+    address: str
+    tcp_port: int
+    last_seen: float
+    name: str = "?"
+    role: str = "?"
+    node_id: str = ""
+    node_public_key_fingerprint: str = ""
 
 
 class PeerDirectory:
     def __init__(self):
-        self.lock = threading.RLock(); self.peers: Dict[str, Peer] = {}
+        self.lock = threading.RLock()
+        self.peers: Dict[str, Peer] = {}
 
-    def upsert(self, peer_id, public_key, address, tcp_port, name="?", role="?"):
+    def upsert(
+        self, peer_id, public_key, address, tcp_port,
+        name="?", role="?", node_id=None,
+        node_public_key_fingerprint=None,
+    ):
         with self.lock:
-            self.peers[peer_id] = Peer(peer_id, public_key, address, int(tcp_port),
-                                       unix_time(), name, role)
+            previous = self.peers.get(peer_id)
+            if node_id is None:
+                node_id = previous.node_id if previous else ""
+            if node_public_key_fingerprint is None:
+                node_public_key_fingerprint = (
+                    previous.node_public_key_fingerprint if previous else ""
+                )
+
+            self.peers[peer_id] = Peer(
+                peer_id,
+                public_key,
+                address,
+                int(tcp_port),
+                unix_time(),
+                name,
+                role,
+                str(node_id or ""),
+                str(node_public_key_fingerprint or ""),
+            )
 
     def alive(self, max_age=P2P_PEER_TIMEOUT):
         cutoff = unix_time() - max_age
@@ -2042,6 +2162,10 @@ class P2PNetwork:
         self.udp_port = udp_port
         self.tcp_port = tcp_port
         self.running = False
+        self._lifecycle_lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._threads = set()
+        self._sockets = set()
 
         # SCP-1 identity is owned by the Symbiont root and injected into P2P.
         self.scp_identity = scp_identity
@@ -2057,6 +2181,7 @@ class P2PNetwork:
             if item.strip()
         ]
 
+        self._scp1_env_trusted_nodes = set(trusted_nodes)
         self.scp1 = (
             get_scp1_zerotrust(
                 trusted_nodes=trusted_nodes
@@ -2064,6 +2189,17 @@ class P2PNetwork:
             if get_scp1_zerotrust is not None
             else None
         )
+        self._managed_scp1 = self.scp1
+        self.peer_security = (
+            get_peer_security(
+                self.node.peers,
+                self.scp1,
+                tsk=getattr(self.node, "tsk", None),
+            )
+            if get_peer_security is not None and self.scp1 is not None
+            else None
+        )
+        self._sync_scp1_trust()
 
         # SCP-1 P2P transport remains opt-in for now.
         self.scp1_enabled = (
@@ -2076,13 +2212,187 @@ class P2PNetwork:
             in {"1", "true", "yes", "on"}
         )
 
-    def start(self):
-        self.running = True
-        threading.Thread(target=self._udp_listen, daemon=True).start()
-        threading.Thread(target=self._udp_beacon, daemon=True).start()
-        threading.Thread(target=self._tcp_server, daemon=True).start()
+        self._beacon_seen = {}
+        self._beacon_seen_lock = threading.RLock()
 
-    def stop(self): self.running = False
+    def _sync_scp1_trust(self):
+        """Synchronize ENV trust and strictly validated TSK-derived trust."""
+        if self.scp1 is None:
+            return False
+
+        # An explicitly injected adapter is externally managed.
+        if self.scp1 is not self._managed_scp1:
+            return False
+
+        trusted_nodes = set(self._scp1_env_trusted_nodes)
+
+        # TSK trust alone is insufficient. Each discovered peer must pass
+        # PeerSecurity's CoreNodeBinding and trust-graph checks.
+        if self.peer_security is not None:
+            try:
+                for peer in self.node.peers.list_all():
+                    node_id = str(getattr(peer, "node_id", ""))
+                    node_fingerprint = str(
+                        getattr(peer, "node_public_key_fingerprint", "")
+                    )
+                    if not node_id or not node_fingerprint:
+                        continue
+
+                    if self.peer_security.register_trusted(
+                        peer.peer_id,
+                        node_id,
+                        node_fingerprint,
+                    ):
+                        trusted_nodes.add(node_id)
+            except Exception:
+                # Fail closed for TSK-derived trust; ENV entries remain.
+                pass
+
+        self.scp1.set_trusted_nodes(trusted_nodes)
+        return True
+
+    def start(self):
+        with self._lifecycle_lock:
+            if self.running:
+                return False
+            if any(thread.is_alive() for thread in self._threads):
+                return False
+            self._stop_event.clear()
+            self.running = True
+
+        try:
+            for target, name in (
+                (self._udp_listen, "Symbiont-P2P-UDP-Listener"),
+                (self._udp_beacon, "Symbiont-P2P-UDP-Beacon"),
+                (self._tcp_server, "Symbiont-P2P-TCP-Server"),
+            ):
+                if not self._spawn_worker(target, name=name):
+                    self.stop()
+                    return False
+        except Exception:
+            self.stop()
+            raise
+
+        return True
+
+    def stop(self):
+        with self._lifecycle_lock:
+            self.running = False
+            self._stop_event.set()
+            sockets = list(self._sockets)
+            threads = list(self._threads)
+
+        for sock in sockets:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        current = threading.current_thread()
+        for thread in threads:
+            if thread is not current:
+                thread.join(timeout=3.0)
+
+        with self._lifecycle_lock:
+            return not any(
+                thread.is_alive()
+                for thread in self._threads
+                if thread is not current
+            )
+
+    def _spawn_worker(self, target, args=(), name=None):
+        with self._lifecycle_lock:
+            if not self.running or self._stop_event.is_set():
+                return False
+
+            def run():
+                try:
+                    target(*args)
+                finally:
+                    with self._lifecycle_lock:
+                        self._threads.discard(threading.current_thread())
+
+            thread = threading.Thread(
+                target=run,
+                name=name,
+                daemon=True,
+            )
+            self._threads.add(thread)
+            try:
+                thread.start()
+            except Exception:
+                self._threads.discard(thread)
+                raise
+
+            return True
+
+    def _register_socket(self, sock):
+        with self._lifecycle_lock:
+            if not self.running or self._stop_event.is_set():
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+                return False
+
+            self._sockets.add(sock)
+            return True
+
+    def _unregister_socket(self, sock):
+        lock = getattr(self, "_lifecycle_lock", None)
+        sockets = getattr(self, "_sockets", None)
+
+        if lock is None or sockets is None:
+            return
+
+        with lock:
+            sockets.discard(sock)
+
+    # Length-prefixed TCP framing for multi-message SCP-1 sessions.
+    _TCP_FRAME_HEADER = struct.Struct("!I")
+    _TCP_FRAME_MAX = 1024 * 1024
+
+    @classmethod
+    def _recv_exact(cls, conn, size):
+        if type(size) is not int or size < 0:
+            raise ValueError("Invalid TCP frame size")
+
+        chunks = []
+        remaining = size
+
+        while remaining:
+            chunk = conn.recv(remaining)
+            if not chunk:
+                raise ConnectionError("Incomplete TCP frame")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+        return b"".join(chunks)
+
+    @classmethod
+    def _send_tcp_frame(cls, conn, payload):
+        raw = canonical_json(payload).encode("utf-8")
+        if not raw or len(raw) > cls._TCP_FRAME_MAX:
+            raise ValueError("TCP frame size out of range")
+
+        header = cls._TCP_FRAME_HEADER.pack(len(raw))
+        conn.sendall(header + raw)
+
+    @classmethod
+    def _recv_tcp_frame(cls, conn):
+        header = cls._recv_exact(conn, cls._TCP_FRAME_HEADER.size)
+        size = cls._TCP_FRAME_HEADER.unpack(header)[0]
+
+        if size < 1 or size > cls._TCP_FRAME_MAX:
+            raise ValueError("TCP frame size out of range")
+
+        raw = cls._recv_exact(conn, size)
+        value = json.loads(raw.decode("utf-8"))
+
+        if not isinstance(value, dict):
+            raise ValueError("TCP frame must contain a JSON object")
+
+        return value
 
     def _scp1_wrap(self, payload, message_type="P2P"):
         if (
@@ -2123,6 +2433,7 @@ class P2PNetwork:
         if not isinstance(packet, dict):
             return None
 
+        self._sync_scp1_trust()
         if not self.scp1.verify(packet):
             return None
 
@@ -2151,6 +2462,60 @@ class P2PNetwork:
 
         return payload
 
+    def _scp1_receive_checked(
+        self, wire, expected_type, expected_peer_id=None
+    ):
+        """Verify one SCP-1 packet exactly once, then enforce its envelope."""
+        unwrapped = self._scp1_unwrap(
+            wire,
+            expected_peer_id=expected_peer_id,
+            return_identity=True,
+        )
+        if unwrapped is None:
+            return None
+
+        packet = wire.get("scp1") if isinstance(wire, dict) else None
+        if not isinstance(packet, dict):
+            return None
+
+        if packet.get("type") != expected_type:
+            return None
+
+        if packet.get("capability") != "network.send":
+            return None
+
+        return unwrapped
+
+    def _scp1_verified_peer(self, core_id, signer):
+        """Resolve a peer only when its stored Node identity and TSK binding match."""
+        if not isinstance(core_id, str) or not core_id.strip():
+            return None
+        if not isinstance(signer, dict):
+            return None
+
+        peer = self.node.peers.get(core_id)
+        if peer is None:
+            return None
+
+        stored_node_id = str(getattr(peer, "node_id", ""))
+        stored_fingerprint = str(
+            getattr(peer, "node_public_key_fingerprint", "")
+        )
+
+        if not stored_node_id or not stored_fingerprint:
+            return None
+
+        if signer.get("node_id") != stored_node_id:
+            return None
+
+        if signer.get("public_key_fingerprint") != stored_fingerprint:
+            return None
+
+        if not self._scp1_binding_matches(core_id, peer, signer):
+            return None
+
+        return peer
+
     def _scp1_binding_matches(self, sender, peer, signer):
         """Require a persisted owner-confirmed Core ID <-> SCP-1 key binding."""
         if not sender or peer is None or not isinstance(signer, dict):
@@ -2176,147 +2541,390 @@ class P2PNetwork:
         except Exception:
             return False
 
+    def _verify_beacon_wire(self, wire):
+        """Authenticate discovery announcements without granting peer trust."""
+        if SCP1 is None or not isinstance(wire, dict):
+            return None
+
+        packet = wire.get("scp1")
+        if not isinstance(packet, dict):
+            return None
+
+        try:
+            if not SCP1.verify(packet):
+                return None
+
+            if packet.get("type") != "BEACON":
+                return None
+            if packet.get("capability") != "network.discovery":
+                return None
+
+            payload = packet.get("payload")
+            if not isinstance(payload, dict):
+                return None
+
+            core_id = payload.get("core_id")
+            core_public_key = payload.get("core_public_key")
+            tcp_port = payload.get("tcp_port")
+
+            if not isinstance(core_id, str) or not core_id.strip():
+                return None
+            if not isinstance(core_public_key, str) or not core_public_key.strip():
+                return None
+            if type(tcp_port) is not int or not 1 <= tcp_port <= 65535:
+                return None
+
+            node_id = str(packet.get("node_id", ""))
+            packet_id = str(packet.get("packet_id", ""))
+            if not node_id or not packet_id:
+                return None
+
+            now = unix_time()
+            replay_key = (node_id, packet_id)
+
+            with self._beacon_seen_lock:
+                self._beacon_seen = {
+                    key: seen_at
+                    for key, seen_at in self._beacon_seen.items()
+                    if now - seen_at <= 300
+                }
+
+                if replay_key in self._beacon_seen:
+                    return None
+
+                if len(self._beacon_seen) >= 4096:
+                    oldest = min(
+                        self._beacon_seen,
+                        key=self._beacon_seen.get,
+                    )
+                    self._beacon_seen.pop(oldest, None)
+
+                self._beacon_seen[replay_key] = now
+
+            return payload, node_id
+
+        except Exception:
+            return None
+
     def _udp_beacon(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        while self.running:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if not self._register_socket(sock):
+                return
+
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+            while self.running and not self._stop_event.is_set():
+                try:
+                    if self.scp_identity is not None and SCP1 is not None:
+                        payload = {
+                            "core_id": self.node.identity.id(),
+                            "core_public_key": self.node.identity.public_key(),
+                            "name": self.node.profile.name(),
+                            "role": self.node.profile.role(),
+                            "tcp_port": self.tcp_port,
+                            "battery": self.node.bodies.battery(),
+                        }
+
+                        packet = SCP1.build_payload(
+                            node_id=self.scp_identity.node_id,
+                            public_key=self.scp_identity.public_key,
+                            payload=payload,
+                            capability="network.discovery",
+                            message_type="BEACON",
+                        )
+                        packet = SCP1.sign(
+                            self.scp_identity.private_key,
+                            packet,
+                        )
+
+                        raw = canonical_json({"scp1": packet}).encode("utf-8")
+
+                        for target in broadcast_targets():
+                            if self._stop_event.is_set():
+                                break
+                            try:
+                                sock.sendto(raw, (target, self.udp_port))
+                            except OSError:
+                                if self._stop_event.is_set():
+                                    break
+                            except Exception:
+                                pass
+
+                except Exception:
+                    pass
+
+                if self._stop_event.wait(P2P_BROADCAST_INTERVAL):
+                    break
+
+        finally:
+            self._unregister_socket(sock)
             try:
-                pkt = {"type": "BEACON",
-                       "symbiont_id": self.node.identity.id(),
-                       "public_key": self.node.identity.public_key(),
-                       "name": self.node.profile.name(),
-                       "role": self.node.profile.role(),
-                       "tcp_port": self.tcp_port,
-                       "battery": self.node.bodies.battery(),
-                       "timestamp": unix_time()}
-                pkt["signature"] = self.node.identity.sign(pkt)
-                raw = canonical_json(pkt).encode("utf-8")
-                for t in broadcast_targets():
-                    try: s.sendto(raw, (t, self.udp_port))
-                    except Exception: pass
-            except Exception: pass
-            time.sleep(P2P_BROADCAST_INTERVAL)
+                sock.close()
+            except OSError:
+                pass
 
     def _udp_listen(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: s.bind(("", self.udp_port))
-        except Exception: return
-        s.settimeout(1.0)
-        while self.running:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            if not self._register_socket(sock):
+                return
+
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", self.udp_port))
+            sock.settimeout(1.0)
+
+            while self.running and not self._stop_event.is_set():
+                try:
+                    data, addr = sock.recvfrom(4096)
+                    wire = json.loads(data.decode("utf-8"))
+
+                    verified = self._verify_beacon_wire(wire)
+                    if verified is None:
+                        continue
+
+                    payload, node_id = verified
+
+                    if (
+                        self.scp_identity is not None
+                        and node_id == self.scp_identity.node_id
+                    ):
+                        continue
+
+                    peer_id = payload["core_id"]
+                    if peer_id == self.node.identity.id():
+                        continue
+
+                    # SCP1.verify() has authenticated this beacon signer.
+                    # Store the signer's Node identity separately from Core ID.
+                    try:
+                        packet = wire["scp1"]
+                        if str(packet.get("node_id", "")) != str(node_id):
+                            continue
+
+                        signer_public_key = base64.b64decode(
+                            packet["public_key"], validate=True
+                        )
+                        node_fingerprint = hashlib.sha256(
+                            signer_public_key
+                        ).hexdigest()
+                    except Exception:
+                        continue
+
+                    public_key = payload["core_public_key"]
+                    was_new = self.node.peers.get(peer_id) is None
+
+                    self.node.peers.upsert(
+                        peer_id,
+                        public_key,
+                        addr[0],
+                        payload["tcp_port"],
+                        payload.get("name", "?"),
+                        payload.get("role", "?"),
+                        node_id=node_id,
+                        node_public_key_fingerprint=node_fingerprint,
+                    )
+
+                    # Discovery alone grants no trust. This sync admits the
+                    # Node only if PeerSecurity validates its TSK binding.
+                    self._sync_scp1_trust()
+
+                    if was_new:
+                        self.node.memory.remember(
+                            f"Обнаружен Symbiont: {payload.get('name')} ({peer_id[:12]})",
+                            kind="network",
+                            importance=4,
+                            source="p2p",
+                        )
+                        print(
+                            f"\n[P2P] 🎯 {payload.get('name')} "
+                            f"[{payload.get('role', '?')}] @ {addr[0]}"
+                        )
+
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop_event.is_set():
+                        break
+                except Exception:
+                    pass
+
+        except OSError:
+            if not self._stop_event.is_set():
+                self.node.journal.append(
+                    "p2p.udp_listener_failed",
+                    {"error_type": "OSError"},
+                )
+        finally:
+            self._unregister_socket(sock)
             try:
-                data, addr = s.recvfrom(4096)
-                pkt = json.loads(data.decode("utf-8"))
-                if pkt.get("type") != "BEACON": continue
-                pid = pkt.get("symbiont_id")
-                if pid == self.node.identity.id(): continue
-                pub = pkt.get("public_key", ""); sig = pkt.get("signature", "")
-                if not self.node.identity.verify(pkt, sig, pub): continue
-                was_new = self.node.peers.get(pid) is None
-                self.node.peers.upsert(pid, pub, addr[0], pkt.get("tcp_port", self.tcp_port),
-                                       pkt.get("name", "?"), pkt.get("role", "?"))
-                if was_new:
-                    self.node.memory.remember(
-                        f"Обнаружен Symbiont: {pkt.get('name')} ({pid[:12]})",
-                        kind="network", importance=4, source="p2p")
-                    print(f"\n[P2P] 🎯 {pkt.get('name')} [{pkt.get('role','?')}] @ {addr[0]}")
-            except socket.timeout: continue
-            except Exception: pass
+                sock.close()
+            except OSError:
+                pass
 
     def _tcp_server(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: s.bind(("", self.tcp_port)); s.listen(8)
-        except Exception: return
-        s.settimeout(1.0)
-        while self.running:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            if not self._register_socket(sock):
+                return
+
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", self.tcp_port))
+            sock.listen(8)
+            sock.settimeout(1.0)
+
+            while self.running and not self._stop_event.is_set():
+                try:
+                    conn, addr = sock.accept()
+
+                    if not self._register_socket(conn):
+                        continue
+
+                    if not self._spawn_worker(
+                        self._handle_tcp,
+                        args=(conn, addr),
+                        name="Symbiont-P2P-TCP-Client",
+                    ):
+                        self._unregister_socket(conn)
+                        conn.close()
+
+                except socket.timeout:
+                    continue
+                except OSError:
+                    if self._stop_event.is_set():
+                        break
+                except Exception:
+                    pass
+
+        except OSError:
+            if not self._stop_event.is_set():
+                self.node.journal.append(
+                    "p2p.tcp_server_failed",
+                    {"error_type": "OSError"},
+                )
+        finally:
+            self._unregister_socket(sock)
             try:
-                conn, addr = s.accept()
-                threading.Thread(target=self._handle_tcp, args=(conn, addr), daemon=True).start()
-            except socket.timeout: continue
-            except Exception: pass
+                sock.close()
+            except OSError:
+                pass
+
+    def _scp1_server_handshake(self, conn):
+        """Complete mutual SCP-1 authentication on the current TCP connection."""
+        if NodeHandshake is None or self.scp_identity is None:
+            return None
+
+        try:
+            # Phase 1: receive and authenticate HELLO exactly once.
+            hello_wire = self._recv_tcp_frame(conn)
+            received = self._scp1_receive_checked(
+                hello_wire, expected_type="HANDSHAKE"
+            )
+            if received is None:
+                return None
+
+            hello_payload, hello_signer = received
+            core_id = hello_payload.get("core_id")
+            peer = self._scp1_verified_peer(core_id, hello_signer)
+            if peer is None:
+                return None
+
+            peer_node_id = str(getattr(peer, "node_id", ""))
+            if not peer_node_id:
+                return None
+
+            handshake = NodeHandshake(
+                self.scp_identity,
+                scp=SCP1,
+                expected_peer_node_id=peer_node_id,
+            )
+
+            challenge = handshake.create_challenge(
+                hello_payload, peer_node_id
+            )
+            if challenge is None:
+                return None
+
+            self._send_tcp_frame(conn, {"scp1": challenge})
+
+            # Phase 2: authenticate FINISH from the same bound peer.
+            finish_wire = self._recv_tcp_frame(conn)
+            received = self._scp1_receive_checked(
+                finish_wire,
+                expected_type="HANDSHAKE",
+                expected_peer_id=peer_node_id,
+            )
+            if received is None:
+                return None
+
+            finish_payload, finish_signer = received
+            if finish_payload.get("core_id") != core_id:
+                return None
+
+            if not self._scp1_verified_peer(core_id, finish_signer):
+                return None
+
+            if not handshake.accept_finish(
+                finish_payload, peer_node_id
+            ):
+                return None
+
+            # The server sends ESTABLISHED only after validating FINISH.
+            established = handshake.established()
+            self._send_tcp_frame(conn, {"scp1": established})
+
+            return peer, handshake
+
+        except Exception:
+            return None
 
     def _handle_tcp(self, conn, addr):
         try:
+            if not self.scp1_enabled:
+                conn.sendall(canonical_json({
+                    "status": "UNAUTHORIZED",
+                    "reason": "scp1_required",
+                }).encode("utf-8"))
+                return
+
             conn.settimeout(8.0)
 
-            data = conn.recv(65536)
-
-            if not data:
+            # Mutual authentication is mandatory before any operation.
+            result = self._scp1_server_handshake(conn)
+            if result is None:
                 return
 
-            wire = json.loads(
-                data.decode("utf-8")
+            peer, handshake = result
+            peer_id = str(peer.peer_id)
+            peer_node_id = str(getattr(peer, "node_id", ""))
+
+            wire = self._recv_tcp_frame(conn)
+            received = self._scp1_unwrap(
+                wire,
+                expected_peer_id=peer_node_id,
+                return_identity=True,
             )
-
-            # SCP-1 becomes the authenticated network envelope
-            # when explicitly enabled.
-            scp_signer = None
-            if self.scp1_enabled:
-                unwrapped = self._scp1_unwrap(
-                    wire, return_identity=True
-                )
-
-                if unwrapped is None:
-                    conn.sendall(
-                        canonical_json({
-                            "status": "UNAUTHORIZED",
-                            "reason": "scp1",
-                        }).encode()
-                    )
-                    return
-
-                req, scp_signer = unwrapped
-            else:
-                req = wire
-
-            # Keep existing Core Identity verification for
-            # compatibility with the current P2P protocol.
-            sender = req.get("sender")
-            sig = req.get("signature", "")
-            peer = self.node.peers.get(sender)
-
-            binding_ok = (
-                self._scp1_binding_matches(sender, peer, scp_signer)
-                if self.scp1_enabled
-                else True
-            )
-
-            if (
-                not peer
-                or not binding_ok
-                or (
-                    not self.scp1_enabled
-                    and not self.node.identity.verify(
-                        req,
-                        sig,
-                        peer.public_key,
-                    )
-                )
-            ):
-                response = {
-                    "status": "UNAUTHORIZED"
-                }
-
-                if self.scp1_enabled:
-                    wrapped = self._scp1_wrap(
-                        response,
-                        message_type="RESPONSE",
-                    )
-
-                    if wrapped is not None:
-                        response = wrapped
-
-                conn.sendall(
-                    canonical_json(response).encode()
-                )
+            if received is None:
                 return
 
+            req, signer = received
+            envelope = wire.get("scp1", {}) if isinstance(wire, dict) else {}
             action = req.get("action")
 
-            if action == "QUEST_OFFER":
-                resp = self.node.quests.handle_incoming(req)
+            valid = (
+                isinstance(action, str)
+                and bool(action)
+                and envelope.get("type") == action
+                and envelope.get("capability") == "network.send"
+                and req.get("sender") == peer_id
+                and req.get("session_id") == handshake.session_id
+                and self._scp1_verified_peer(peer_id, signer) is not None
+            )
 
+            if not valid:
+                response = {"status": "UNAUTHORIZED"}
+            elif action == "QUEST_OFFER":
+                response = self.node.quests.handle_incoming(req)
             elif action == "QUEST_PAYMENT":
                 quest_id = req.get("quest_id")
                 creator = req.get("creator")
@@ -2324,47 +2932,45 @@ class P2PNetwork:
                 reward = req.get("reward")
                 currency = req.get("currency")
 
-                if creator != sender:
-                    resp = {
+                if creator != peer_id:
+                    response = {
                         "status": "PAYMENT_REJECTED",
                         "reason": "creator_sender_mismatch",
                     }
-
                 elif worker != self.node.identity.id():
-                    resp = {
+                    response = {
                         "status": "PAYMENT_REJECTED",
                         "reason": "worker_mismatch",
                     }
-
                 elif not quest_id:
-                    resp = {
+                    response = {
                         "status": "PAYMENT_REJECTED",
                         "reason": "missing_quest_id",
                     }
-
-                elif not isinstance(reward, (int, float)) or reward <= 0:
-                    resp = {
+                elif (
+                    not isinstance(reward, (int, float))
+                    or isinstance(reward, bool)
+                    or reward <= 0
+                ):
+                    response = {
                         "status": "PAYMENT_REJECTED",
                         "reason": "invalid_reward",
                     }
-
                 elif currency != CURRENCY:
-                    resp = {
+                    response = {
                         "status": "PAYMENT_REJECTED",
                         "reason": "invalid_currency",
                     }
-
                 else:
-                    received = self.node.economy.receive_quest_payment(
+                    received_payment = self.node.economy.receive_quest_payment(
                         quest_id,
                         float(reward),
                         creator,
                         worker,
                         currency,
                     )
-
-                    if received:
-                        resp = {
+                    if received_payment:
+                        response = {
                             "status": "PAYMENT_RECEIVED",
                             "quest_id": quest_id,
                             "worker": worker,
@@ -2372,114 +2978,178 @@ class P2PNetwork:
                             "currency": currency,
                         }
                     else:
-                        resp = {
+                        response = {
                             "status": "PAYMENT_REJECTED",
                             "reason": "duplicate_or_invalid_payment",
                             "quest_id": quest_id,
                         }
-
             elif action == "PING":
-                resp = {
+                response = {
                     "status": "PONG",
                     "sender": self.node.identity.id(),
                 }
-
             else:
-                resp = {
-                    "status": "UNKNOWN"
-                }
+                response = {"status": "UNKNOWN"}
 
-            if self.scp1_enabled:
-                wrapped = self._scp1_wrap(
-                    resp,
-                    message_type="RESPONSE",
-                )
+            if not isinstance(response, dict):
+                return
 
-                if wrapped is not None:
-                    resp = wrapped
-
-            conn.sendall(
-                canonical_json(resp).encode()
+            response["session_id"] = handshake.session_id
+            wrapped = self._scp1_wrap(
+                response,
+                message_type="RESPONSE",
             )
+            if wrapped is not None:
+                self._send_tcp_frame(conn, wrapped)
 
         except Exception:
             pass
-
         finally:
+            self._unregister_socket(conn)
             try:
                 conn.close()
             except Exception:
                 pass
 
     def send_to(self, peer_id, packet):
-        peer = self.node.peers.get(peer_id)
-
-        if not peer:
+        if (
+            not self.scp1_enabled
+            or self.scp_identity is None
+            or NodeHandshake is None
+            or not isinstance(packet, dict)
+        ):
             return None
 
-        packet["sender"] = self.node.identity.id()
-        packet["signature"] = self.node.identity.sign(packet)
+        peer = self.node.peers.get(peer_id)
+        if peer is None:
+            return None
 
+        peer_node_id = str(getattr(peer, "node_id", ""))
+        peer_fingerprint = str(
+            getattr(peer, "node_public_key_fingerprint", "")
+        )
+        action = packet.get("action")
+
+        if not peer_node_id or not peer_fingerprint:
+            return None
+        if not isinstance(action, str) or not action:
+            return None
+
+        expected_signer = {
+            "node_id": peer_node_id,
+            "public_key_fingerprint": peer_fingerprint,
+        }
+        if not self._scp1_binding_matches(
+            peer_id, peer, expected_signer
+        ):
+            return None
+
+        conn = None
         try:
-            s = socket.socket(
-                socket.AF_INET,
-                socket.SOCK_STREAM,
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.settimeout(8.0)
+            conn.connect((peer.address, peer.tcp_port))
+
+            local_core_id = self.node.identity.id()
+            handshake = NodeHandshake(
+                self.scp_identity,
+                scp=SCP1,
+                expected_peer_node_id=peer_node_id,
             )
 
-            s.settimeout(8.0)
+            # HELLO
+            hello = handshake.hello(core_id=local_core_id)
+            self._send_tcp_frame(conn, {"scp1": hello})
 
-            s.connect(
-                (peer.address, peer.tcp_port)
+            # CHALLENGE
+            challenge_wire = self._recv_tcp_frame(conn)
+            received = self._scp1_receive_checked(
+                challenge_wire,
+                expected_type="HANDSHAKE",
+                expected_peer_id=peer_node_id,
             )
+            if received is None:
+                return None
 
-            if self.scp1_enabled:
-                wire = self._scp1_wrap(
-                    packet,
-                    message_type=packet.get(
-                        "action",
-                        "P2P",
-                    ),
-                )
+            challenge_payload, challenge_signer = received
+            if self._scp1_verified_peer(
+                peer_id, challenge_signer
+            ) is None:
+                return None
+            if not handshake.accept_challenge(
+                challenge_payload, peer_node_id
+            ):
+                return None
 
-                if wire is None:
-                    s.close()
-                    return None
-            else:
-                wire = packet
+            # FINISH
+            finish = handshake.finish(core_id=local_core_id)
+            self._send_tcp_frame(conn, {"scp1": finish})
 
-            s.sendall(
-                canonical_json(wire).encode("utf-8")
+            # ESTABLISHED
+            established_wire = self._recv_tcp_frame(conn)
+            received = self._scp1_receive_checked(
+                established_wire,
+                expected_type="HANDSHAKE",
+                expected_peer_id=peer_node_id,
             )
+            if received is None:
+                return None
 
-            data = s.recv(65536)
-            s.close()
+            established_payload, established_signer = received
+            if self._scp1_verified_peer(
+                peer_id, established_signer
+            ) is None:
+                return None
+            if not handshake.accept_established(
+                established_payload, peer_node_id
+            ):
+                return None
+            if handshake.state != NodeHandshake.ESTABLISHED:
+                return None
 
-            response = json.loads(
-                data.decode("utf-8")
+            # Preserve caller data; add transport fields to a copy.
+            request = dict(packet)
+            request["sender"] = local_core_id
+            request["session_id"] = handshake.session_id
+
+            wire = self._scp1_wrap(
+                request,
+                message_type=action,
             )
+            if wire is None:
+                return None
+            self._send_tcp_frame(conn, wire)
 
-            if self.scp1_enabled:
-                unwrapped = self._scp1_unwrap(
-                    response,
-                    return_identity=True,
-                )
-                if unwrapped is None:
-                    return None
+            # RESPONSE
+            response_wire = self._recv_tcp_frame(conn)
+            received = self._scp1_receive_checked(
+                response_wire,
+                expected_type="RESPONSE",
+                expected_peer_id=peer_node_id,
+            )
+            if received is None:
+                return None
 
-                response_payload, signer = unwrapped
-                if not self._scp1_binding_matches(
-                    peer_id,
-                    peer,
-                    signer,
-                ):
-                    return None
+            response_payload, response_signer = received
+            if self._scp1_verified_peer(
+                peer_id, response_signer
+            ) is None:
+                return None
+            if response_payload.get("session_id") != handshake.session_id:
+                return None
 
-                return response_payload
-
-            return response
+            result = dict(response_payload)
+            result.pop("session_id", None)
+            return result
 
         except Exception:
             return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
 # ============================================================
 # QUESTS
@@ -2602,12 +3272,29 @@ class QuestBoard:
         sender = packet.get("sender")
 
         batt = self.node.bodies.battery()
+        if batt is None:
+            self.node.journal.append(
+                "quest.rejected.battery_unavailable",
+                {"quest_id": quest_id, "reason": "sensor_read_denied"},
+            )
+            return {
+                "status": "REJECTED",
+                "reason": "Battery status unavailable; sensor permission required",
+                "worker": self.node.identity.id(),
+                "battery": None,
+            }
+
         if batt < BATTERY_MIN:
-            self.node.journal.append("quest.rejected.battery",
-                                     {"quest_id": quest_id, "battery": batt})
-            return {"status": "REJECTED",
-                    "reason": f"Low battery ({batt:.1f}%)",
-                    "worker": self.node.identity.id()}
+            self.node.journal.append(
+                "quest.rejected.battery",
+                {"quest_id": quest_id, "battery": batt},
+            )
+            return {
+                "status": "REJECTED",
+                "reason": f"Low battery ({batt:.1f}%)",
+                "worker": self.node.identity.id(),
+                "battery": batt,
+            }
 
         # Replay guard: EventJournal is the existing persistent source
         # of truth for completed incoming quests.
@@ -3077,9 +3764,21 @@ class Economy:
 # ============================================================
 
 class PermissionGate:
-    DEFAULTS = {"screen_read": False, "microphone": False, "camera": False,
-                "network_send": False, "file_write": True, "external_ai": False,
-                "task_execution": False, "ambient_listen": False}
+    DEFAULTS = {
+        "screen_read": False,
+        "microphone": False,
+        "camera": False,
+        "sensor_read": False,
+        "location_read": False,
+        "device_speak": False,
+        "device_notify": False,
+        "device_vibrate": False,
+        "network_send": False,
+        "file_write": True,
+        "external_ai": False,
+        "task_execution": False,
+        "ambient_listen": False,
+    }
 
     def __init__(self):
         self.lock = threading.RLock()
@@ -3225,6 +3924,10 @@ class ContextBus:
 class Symbiont:
     def __init__(self, root=ROOT_DIR, show_recovery_phrase=True):
         self.root = Path(root); self.root.mkdir(parents=True, exist_ok=True)
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_complete = False
+        self._shutdown_event_written = False
+        self._shutdown_closed_components = set()
         self.journal = EventJournal(self.root / "events.log")
 
         # SSS stores evidence; SIS anchors it. Neither authorizes actions.
@@ -3272,19 +3975,48 @@ class Symbiont:
 
         self.identity = Identity(self.root / "identity.json")
 
+        # NodeIdentity is independent from Core Identity (which uses HMAC).
+        # Initialize it before SCA-1 so Shadow never labels an HMAC value Ed25519.
+        self.scp_identity = None
+        if NodeIdentity is not None:
+            try:
+                self.scp_identity = NodeIdentity(
+                    self.root / "node_identity.json"
+                )
+            except Exception as exc:
+                self.journal.append(
+                    "node_identity.initialization_failed",
+                    {
+                        "error_type": type(exc).__name__,
+                        "mode": "identity_preserved_scp1_disabled",
+                    },
+                )
+
         self.continuity_shadow = None
+        self.continuity_shadow_error = None
         if (
             ContinuityShadow is not None
             and ContinuityShadow.enabled_from_env()
         ):
-            self.continuity_shadow = ContinuityShadow(
-                self.root,
-                self.identity,
-            )
-            self.journal.add_listener(
-                self.continuity_shadow.on_core_event,
-                replay_existing=True,
-            )
+            if self.scp_identity is None:
+                self.continuity_shadow_error = (
+                    "NodeIdentity unavailable; SCA-1 Shadow remains disabled"
+                )
+            else:
+                try:
+                    candidate_shadow = ContinuityShadow(
+                        self.root,
+                        self.scp_identity,
+                    )
+                    self.journal.add_listener(
+                        candidate_shadow.on_core_event,
+                        replay_existing=True,
+                    )
+                    self.continuity_shadow = candidate_shadow
+                except Exception as exc:
+                    self.continuity_shadow_error = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
 
         self.profile = AgentProfile(self.root / "agent.json")
         self.devices = DeviceRegistry(self.root / "devices.json", self.identity.id())
@@ -3329,6 +4061,7 @@ class Symbiont:
         # SMSA receives only a runtime mirror of mapped capabilities.
         # SMSA persistent OwnerPolicy is NOT modified by this bridge.
         self.permissions = PermissionGate()
+        self.bodies.set_permission_checker(self.permissions.check)
         self.smsa = None
 
         if (
@@ -3367,22 +4100,6 @@ class Symbiont:
 
         self.peers = PeerDirectory()
         self.quests = QuestBoard(self)
-        # NodeIdentity failure disables SCP-1 identity only; Core keeps its data.
-        self.scp_identity = None
-        if NodeIdentity is not None:
-            try:
-                self.scp_identity = NodeIdentity(
-                    self.root / "node_identity.json"
-                )
-            except Exception as exc:
-                self.journal.append(
-                    "node_identity.initialization_failed",
-                    {
-                        "error_type": type(exc).__name__,
-                        "mode": "identity_preserved_scp1_disabled",
-                    },
-                )
-
         # TSK is optional and non-destructive:
         # Load only an existing, integrity-checked TSK state.
         # Never derive a separate TSK identity implicitly from Core's phrase.
@@ -3720,7 +4437,12 @@ class Symbiont:
 
     def status(self):
         valid, events = self.journal.verify()
-        journal_status = {"valid": valid, "events": events}
+        journal_status = {
+            "valid": valid,
+            "events": events,
+            "observer_error_count": self.journal._listener_error_count,
+            "last_observer_error": self.journal._last_listener_error,
+        }
 
         immune_memory_status = {
             "enabled": self.immune_memory is not None,
@@ -3841,7 +4563,12 @@ class Symbiont:
             "continuity": (
                 self.continuity_shadow.status()
                 if self.continuity_shadow
-                else {"enabled": False}
+                else {
+                    "enabled": False,
+                    "error": self.continuity_shadow_error,
+                    "observer_error_count": self.journal._listener_error_count,
+                    "last_observer_error": self.journal._last_listener_error,
+                }
             ),
             "llm": self.llm_status(),
             "listening": self.listener.is_active(),
@@ -3849,13 +4576,59 @@ class Symbiont:
         }
 
     def close(self):
-        self.listener.stop(); self.p2p.stop()
-        self.journal.append("symbiont.shutdown", {"id": self.identity.id()})
-        if self.sis_integrity is not None:
-            self.sis_integrity.close()
-        if self.immune_memory is not None:
-            self.immune_memory.close()
-        self.memory.close()
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return True
+
+            # Сначала останавливаем все фоновые потоки.
+            # Хранилища нельзя закрывать, пока потоки могут ими пользоваться.
+            try:
+                listener_stopped = self.listener.stop()
+            except Exception:
+                listener_stopped = False
+
+            try:
+                p2p_stopped = self.p2p.stop()
+            except Exception:
+                p2p_stopped = False
+
+            if not listener_stopped or not p2p_stopped:
+                return False
+
+            # Записываем событие завершения ровно один раз.
+            if not self._shutdown_event_written:
+                try:
+                    self.journal.append(
+                        "symbiont.shutdown",
+                        {"id": self.identity.id()},
+                    )
+                    self._shutdown_event_written = True
+                except Exception:
+                    return False
+
+            # Закрываем ресурсы независимо: ошибка одного не пропускает остальные.
+            components = (
+                ("sis_integrity", self.sis_integrity),
+                ("immune_memory", self.immune_memory),
+                ("memory", self.memory),
+            )
+
+            failed = False
+            for name, component in components:
+                if component is None or name in self._shutdown_closed_components:
+                    continue
+
+                try:
+                    component.close()
+                    self._shutdown_closed_components.add(name)
+                except Exception:
+                    failed = True
+
+            if failed:
+                return False
+
+            self._shutdown_complete = True
+            return True
 
 
 # ============================================================
@@ -3864,6 +4637,12 @@ class Symbiont:
 
 class Shell:
     def __init__(self, sym): self.sym = sym
+
+    def require_permission(self, capability):
+        if not self.sym.permissions.check(capability):
+            print(f"[DENIED] Нет разрешения: {capability}")
+            return False
+        return True
 
     def banner(self):
         n = self.sym.profile.name()
@@ -3875,7 +4654,11 @@ class Shell:
         print(f" Имя: {n} | Роль: {self.sym.profile.role()} | Стиль: {self.sym.profile.style()}")
         d = self.sym.devices.status()
         print(f" Устройство: {d['this_device']} | {'PRIMARY' if d['is_primary'] else 'SECONDARY'}")
-        print(f" Тело: {self.sym.bodies.active()} | Батарея: {self.sym.bodies.battery():.0f}%")
+        if self.sym.permissions.check("sensor_read"):
+            battery_text = f"{self.sym.bodies.battery():.0f}%"
+        else:
+            battery_text = "доступ закрыт"
+        print(f" Тело: {self.sym.bodies.active()} | Батарея: {battery_text}")
         llm = self.sym.llm_status()
         if llm.get("enabled") and llm.get("available"):
             print(f" LLM: {llm['name']} / {llm.get('model', '?')}")
@@ -3894,24 +4677,27 @@ class Shell:
         return False
 
     def run(self):
-        self.banner(); self.sym.p2p.start()
         try:
-            last = self.sym.memory.last_night_report()
-            if not last and self.sym.memory.count() > 3:
-                print("  [Напиши 'night' — разберу накопленное.]\n")
-        except Exception: pass
-
-        while True:
-            try: raw = input("> ").strip()
-            except (EOFError, KeyboardInterrupt): print(); break
-            cleaned = clean_input(raw)
-            if not cleaned: continue
-            if self.sym.listener.is_active(): self.sym.listener.feed(cleaned)
+            self.banner(); self.sym.p2p.start()
             try:
-                if not self.execute(cleaned): break
-            except Exception as exc:
-                print(f"[error] {exc}")
-        self.sym.close()
+                last = self.sym.memory.last_night_report()
+                if not last and self.sym.memory.count() > 3:
+                    print("  [Напиши 'night' — разберу накопленное.]\n")
+            except Exception: pass
+
+            while True:
+                try: raw = input("> ").strip()
+                except (EOFError, KeyboardInterrupt): print(); break
+                cleaned = clean_input(raw)
+                if not cleaned: continue
+                if self.sym.listener.is_active(): self.sym.listener.feed(cleaned)
+                try:
+                    if not self.execute(cleaned): break
+                except Exception as exc:
+                    print(f"[error] {exc}")
+            self.sym.close()
+        finally:
+            self.sym.close()
 
     def execute(self, raw):
         raw = clean_input(raw)
@@ -3921,6 +4707,43 @@ class Shell:
         if cmd == "help": self.help(); return True
         if cmd == "status":
             print(json.dumps(self.sym.status(), ensure_ascii=False, indent=2)); return True
+
+        if cmd == "permission":
+            parts = arg.split()
+            if not parts or parts[0].lower() == "list":
+                print(json.dumps(
+                    self.sym.permissions.snapshot(),
+                    ensure_ascii=False,
+                    indent=2,
+                ))
+                return True
+
+            if len(parts) != 2 or parts[0].lower() not in {"allow", "deny"}:
+                print("Usage: permission list | allow <capability> | deny <capability>")
+                return True
+
+            action, capability = parts[0].lower(), parts[1].lower()
+            if capability not in self.sym.permissions.snapshot():
+                print(f"Неизвестное разрешение: {capability}")
+                return True
+
+            if action == "allow":
+                self.sym.permissions.allow(capability)
+                event = "security.permission.granted"
+            else:
+                self.sym.permissions.deny(capability)
+                event = "security.permission.denied"
+
+            try:
+                self.sym.journal.append(event, {
+                    "capability": capability,
+                    "actor": "owner_shell",
+                })
+            except Exception:
+                pass
+
+            print(f"{capability}: {'разрешено' if action == 'allow' else 'запрещено'}")
+            return True
 
         if cmd == "immunity":
             if arg.strip().lower() != "scan":
@@ -4094,7 +4917,9 @@ class Shell:
         if cmd in ("body", "тело"):
             if not arg:
                 b = self.sym.bodies.list()
-                print(f"Активное: {self.sym.bodies.active()} | Батарея: {self.sym.bodies.battery():.0f}%")
+                batt = self.sym.bodies.battery()
+                battery_text = f"{batt:.0f}%" if batt is not None else "доступ закрыт"
+                print(f"Активное: {self.sym.bodies.active()} | Батарея: {battery_text}")
                 for k, v in b.items(): print(f"  • {k} [{v.get('status')}]")
                 return True
             parts = arg.split()
@@ -4103,7 +4928,9 @@ class Shell:
             if len(parts) >= 2 and parts[0] == "battery":
                 try:
                     lvl = float(parts[1]); self.sym.bodies.set_battery(lvl)
-                    print(f"Батарея: {self.sym.bodies.battery():.0f}%"); return True
+                    batt = self.sym.bodies.battery()
+                    battery_text = f"{batt:.0f}%" if batt is not None else "доступ закрыт"
+                    print(f"Батарея: {battery_text}"); return True
                 except Exception as e: print(f"[error] {e}"); return True
             if self.sym.bodies.set_active(arg): print(f"Активное тело: {arg}")
             else: print("Неизвестное тело.")
@@ -4178,11 +5005,13 @@ class Shell:
 
         if cmd in ("speak", "голос"):
             if not arg: print("Usage: speak <text>"); return True
+            if not self.require_permission("device_speak"): return True
             if BODY is not None and BODY.speak(arg): print(f"Произнесено: {arg}")
             else: print("Тело не поддерживает голос.")
             return True
 
         if cmd in ("listen", "услышь"):
+            if not self.require_permission("microphone"): return True
             if BODY is None: print("Тело не подключено."); return True
             text = BODY.listen()
             if text:
@@ -4194,21 +5023,25 @@ class Shell:
 
         if cmd == "notify":
             if not arg: print("Usage: notify <text>"); return True
+            if not self.require_permission("device_notify"): return True
             if BODY is not None and BODY.notify("Сим", arg): print("Уведомление отправлено.")
             else: print("Уведомления недоступны.")
             return True
 
         if cmd == "sensor":
+            if not self.require_permission("sensor_read"): return True
             if BODY is None: print("Тело не подключено."); return True
             print(json.dumps(BODY.sensor(arg or "accelerometer"), ensure_ascii=False, indent=2))
             return True
 
         if cmd == "location":
+            if not self.require_permission("location_read"): return True
             if BODY is None: print("Тело не подключено."); return True
             print(json.dumps(BODY.location(), ensure_ascii=False, indent=2))
             return True
 
         if cmd == "vibrate":
+            if not self.require_permission("device_vibrate"): return True
             if BODY is not None and BODY.vibrate(200): print("Вибрация.")
             else: print("Вибрация недоступна.")
             return True
@@ -4242,6 +5075,9 @@ class Shell:
 
   proactive on/off/now
   listen on/off
+  permission list
+  permission allow <capability>
+  permission deny <capability>
   name / alias / style / role / trait
   body [register|battery] <...>
   peers / quest <t>|<d>|<r>|<peer>|<rank>

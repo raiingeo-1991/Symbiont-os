@@ -223,9 +223,10 @@ def test_night_worker_uses_memory_v2_in_candidate_mode():
     assert len(memory_v2.consolidate_calls) == 1
     assert memory_v2.consolidate_calls[0].candidates
 
-    assert "Reflection V2 — кандидаты понимания:" in result
-    assert "Похоже, сегодня основной фокус был на Symbiont." in result
-    assert "Knowledge V2 — принято кандидатов: 1" in result
+    assert "Memory V2 — shadow-статистика:" in result
+    assert "Похоже, сегодня основной фокус был на Symbiont." not in result
+    assert "кандидатов=1" in result
+    assert "принято проверкой=1" in result
 
 
 def test_night_worker_does_not_call_memory_v2_when_disabled():

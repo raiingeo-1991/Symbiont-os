@@ -34,34 +34,68 @@ class ContinuityRecovery:
         )
 
     def load_or_recover(self) -> Optional[ContinuityState]:
-        state = self.load()
-        if state is not None:
-            return state
-
         latest = self.ledger.latest()
+        state = None
+        state_load_error = None
+
+        try:
+            state = self.load()
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            # The verified append-only Ledger is the recovery source. A
+            # malformed/stale state file must not prevent snapshot recovery.
+            state_load_error = exc
 
         if latest is None:
-            return None
+            if state_load_error is not None:
+                raise ContinuityVerificationError(
+                    "state.json is unreadable and Ledger has no recovery snapshot"
+                ) from state_load_error
+            return state
 
         snapshot = latest.payload.get("state_snapshot")
-
         if not isinstance(snapshot, dict):
+            # Older valid Ledger events may not carry snapshots. They can
+            # still support startup only when the existing state binds
+            # exactly to that event's recorded state hash.
+            if (
+                state is not None
+                and latest.state_hash is not None
+                and state.content_hash() == latest.state_hash
+            ):
+                return state
             raise ContinuityVerificationError(
-                "state.json is missing and latest Ledger event has no state snapshot"
+                "latest Ledger event has no state snapshot for recovery"
             )
-
-        recovered = ContinuityState.from_dict(snapshot)
-
         if latest.state_hash is None:
             raise ContinuityVerificationError(
                 "latest Ledger event has no state hash"
             )
 
-        if recovered.content_hash() != latest.state_hash:
+        recovered = ContinuityState.from_dict(snapshot)
+        latest_hash = recovered.content_hash()
+        if latest_hash != latest.state_hash:
             raise ContinuityVerificationError(
                 "recovered state does not match latest Ledger state hash"
             )
 
+        if state is not None and state.content_hash() == latest_hash:
+            return state
+
+        # A parseable state that is not represented in the verified Ledger
+        # is not silently overwritten: it may indicate tampering or divergence.
+        if state is not None:
+            known_state_hashes = {
+                event.state_hash
+                for event in self.ledger.events()
+                if event.state_hash is not None
+            }
+            if state.content_hash() not in known_state_hashes:
+                raise ContinuityVerificationError(
+                    "state.json does not match any verified Ledger state"
+                )
+
+        # Missing, malformed, or known-but-stale state: restore the latest
+        # independently hash-checked snapshot.
         self.save(recovered)
         return recovered
 

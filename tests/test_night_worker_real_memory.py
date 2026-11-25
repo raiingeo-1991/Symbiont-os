@@ -122,8 +122,8 @@ def test_night_worker_real_memoryvault_with_memory_v2_candidate_mode(tmp_path):
         "Сегодня продолжил работу над Symbiont."
     ]
     assert memory_v2.consolidated is True
-    assert "Reflection V2 — кандидаты понимания:" in result
-    assert "Сегодня основной фокус — Symbiont." in result
+    assert "Memory V2 — shadow-статистика:" in result
+    assert "Сегодня основной фокус — Symbiont." not in result
 
     today = __import__("datetime").datetime.now(
         __import__("datetime").timezone.utc
@@ -132,3 +132,4 @@ def test_night_worker_real_memoryvault_with_memory_v2_candidate_mode(tmp_path):
     saved = memory.night_report_for_date(today)
 
     assert saved["text"] == result
+    assert "Сегодня основной фокус — Symbiont." not in saved["text"]

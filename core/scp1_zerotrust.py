@@ -13,6 +13,15 @@ class SCP1ZeroTrust:
         self.trusted_nodes = set(trusted_nodes or [])
         self.replay = replay_guard or SCPReplayGuard()
 
+    def set_trusted_nodes(self, node_ids):
+        """Replace runtime trust with the authoritative synchronized set."""
+        self.trusted_nodes = {
+            str(node_id).strip()
+            for node_id in (node_ids or [])
+            if str(node_id).strip()
+        }
+        return True
+
     def register_node(self, node_id):
         node_id = str(node_id).strip()
         if not node_id:

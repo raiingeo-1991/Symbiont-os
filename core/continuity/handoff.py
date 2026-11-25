@@ -33,11 +33,40 @@ class BodyHandoff:
 class BodyHandoffManager:
     """Coordinates body lifecycle without touching Core business data."""
 
-    def __init__(self, ledger: ContinuityLedger, state: Optional[ContinuityState] = None):
+    def __init__(
+        self,
+        ledger: ContinuityLedger,
+        state: Optional[ContinuityState] = None,
+        state_commit=None,
+    ):
         self.ledger = ledger
         self.state = state or ContinuityState()
+        self._state_commit = state_commit
         self.bodies: Dict[str, BodyIdentity] = {}
         self._restore_bodies_from_ledger()
+
+    def _append_body_event(
+        self,
+        event_type: str,
+        state: ContinuityState,
+        payload: dict,
+        body_id: Optional[str],
+    ):
+        # Every body event carries a recoverable snapshot because Recovery
+        # validates the latest Ledger event, not the latest state transition.
+        event_payload = dict(payload)
+        event_payload["state_snapshot"] = state.as_dict()
+        event = self.ledger.append(
+            event_type,
+            state.state_version,
+            event_payload,
+            body_id=body_id,
+            state_hash=state.content_hash(),
+        )
+        if self._state_commit is not None:
+            self._state_commit(state)
+        self.state = state
+        return event
 
     def _restore_bodies_from_ledger(self) -> None:
         """Rebuild the in-memory body registry from the existing ledger."""
@@ -86,14 +115,10 @@ class BodyHandoffManager:
     def register(self, body: BodyIdentity) -> BodyIdentity:
         if body.body_id in self.bodies:
             raise BodyHandoffError("body already registered")
-        self.bodies[body.body_id] = body
-        self.ledger.append(
-            "BODY_REGISTERED",
-            self.state.state_version,
-            {"body": body.as_dict()},
-            body_id=body.body_id,
-            state_hash=self.state.content_hash(),
+        self._append_body_event(
+            "BODY_REGISTERED", self.state, {"body": body.as_dict()}, body.body_id
         )
+        self.bodies[body.body_id] = body
         return body
 
     def attach(self, body_id: str, activate: bool = True) -> BodyHandoff:
@@ -103,34 +128,25 @@ class BodyHandoffManager:
         current = self.state.active_body
         if current and current != body_id and activate:
             self.detach(current)
+        next_state = self.state.next(active_body=body_id if activate else self.state.active_body)
+        event = self._append_body_event(
+            "BODY_ATTACHED", next_state,
+            {"source_body_id": current, "target_body_id": body_id}, body_id
+        )
         body.touch()
         body.status = BodyStatus.ACTIVE if activate else BodyStatus.ATTACHED
-        next_state = self.state.next(active_body=body_id if activate else self.state.active_body)
-        event = self.ledger.append(
-            "BODY_ATTACHED",
-            next_state.state_version,
-            {"source_body_id": current, "target_body_id": body_id},
-            body_id=body_id,
-            state_hash=next_state.content_hash(),
-        )
-        self.state = next_state
         return BodyHandoff(current, body_id, self.state.state_version,
                            self.state.content_hash(), event.event_sequence)
 
     def detach(self, body_id: str) -> None:
         body = self._body(body_id)
-        body.touch()
         was_active = self.state.active_body == body_id
-        body.status = BodyStatus.DETACHED
         next_state = self.state.next(active_body=None if was_active else self.state.active_body)
-        self.ledger.append(
-            "BODY_DETACHED",
-            next_state.state_version,
-            {"body_id": body_id},
-            body_id=body_id,
-            state_hash=next_state.content_hash(),
+        self._append_body_event(
+            "BODY_DETACHED", next_state, {"body_id": body_id}, body_id
         )
-        self.state = next_state
+        body.touch()
+        body.status = BodyStatus.DETACHED
 
     def handoff(self, source_body_id: str, target_body_id: str) -> BodyHandoff:
         if source_body_id == target_body_id:
@@ -141,25 +157,20 @@ class BodyHandoffManager:
         target = self._body(target_body_id)
         if target.status == BodyStatus.REVOKED:
             raise BodyHandoffError("target body is revoked")
-        source.touch()
-        target.touch()
-
         # The target must be registered before it can become active.
         next_state = self.state.next(active_body=target_body_id)
-        event = self.ledger.append(
-            "BODY_HANDOFF",
-            next_state.state_version,
+        event = self._append_body_event(
+            "BODY_HANDOFF", next_state,
             {
                 "source_body_id": source_body_id,
                 "target_body_id": target_body_id,
                 "source_state_hash": self.state.content_hash(),
-            },
-            body_id=target_body_id,
-            state_hash=next_state.content_hash(),
+            }, target_body_id
         )
+        source.touch()
+        target.touch()
         source.status = BodyStatus.DETACHED
         target.status = BodyStatus.ACTIVE
-        self.state = next_state
         return BodyHandoff(
             source_body_id,
             target_body_id,
@@ -172,15 +183,11 @@ class BodyHandoffManager:
         body = self._body(body_id)
         if self.state.active_body == body_id:
             raise BodyHandoffError("active body must be handed off before revocation")
+        self._append_body_event(
+            "BODY_REVOKED", self.state, {"body_id": body_id}, body_id
+        )
         body.status = BodyStatus.REVOKED
         body.touch()
-        self.ledger.append(
-            "BODY_REVOKED",
-            self.state.state_version,
-            {"body_id": body_id},
-            body_id=body_id,
-            state_hash=self.state.content_hash(),
-        )
 
     def authorize(self, body_id: str) -> bool:
         body = self._body(body_id)

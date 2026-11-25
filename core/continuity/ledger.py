@@ -1,10 +1,10 @@
 """SCA-1 append-only continuity ledger."""
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
+import hashlib
 import json
 import os
-import tempfile
 import threading
 
 from .events import ContinuityEvent
@@ -28,6 +28,8 @@ class ContinuityLedger:
         self.max_event_age = max_event_age
         self._events: List[ContinuityEvent] = []
         self._lock = threading.RLock()
+        self._write_failed = False
+        self._write_failure_reason: Optional[str] = None
         self.high_water_path = (
             self.path.with_suffix(self.path.suffix + ".highwater")
             if self.path else None
@@ -37,17 +39,45 @@ class ContinuityLedger:
             self._load()
 
     def _load(self) -> None:
-        if not self.path or not self.path.exists():
+        if not self.path:
             return
-        events = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            events.append(ContinuityEvent.from_dict(json.loads(line)))
+
+        ledger_exists = self.path.exists()
+        anchor_exists = bool(
+            self.high_water_path and self.high_water_path.exists()
+        )
+
+        if not ledger_exists:
+            if anchor_exists:
+                raise ContinuityVerificationError(
+                    "ledger missing while high-water anchor exists"
+                )
+            return
+
+        try:
+            raw_lines = self.path.read_text(encoding="utf-8").splitlines()
+            events = [
+                ContinuityEvent.from_dict(json.loads(line))
+                for line in raw_lines
+                if line.strip()
+            ]
+        except Exception as exc:
+            raise ContinuityVerificationError(
+                "ledger file is malformed or unreadable"
+            ) from exc
+
         self._events = events
-        if self._events:
-            self.verify()
-            self._verify_high_water()
+        self.verify()
+        self._verify_high_water()
+
+    def _fsync_parent(self, path: Path) -> None:
+        """Persist directory-entry changes where the filesystem supports it."""
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(str(path.parent), flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _write_high_water(self, event: ContinuityEvent) -> None:
         if not self.high_water_path:
@@ -63,33 +93,65 @@ class ContinuityLedger:
         tmp = self.high_water_path.with_suffix(
             self.high_water_path.suffix + ".tmp"
         )
-        tmp.write_text(
-            json.dumps(data, sort_keys=True, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        os.replace(tmp, self.high_water_path)
+        try:
+            with tmp.open("w", encoding="utf-8") as fh:
+                fh.write(json.dumps(
+                    data, sort_keys=True, ensure_ascii=False, indent=2
+                ))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self.high_water_path)
+            self._fsync_parent(self.high_water_path)
+        finally:
+            # Safe after replace (the temporary path no longer exists).
+            try:
+                tmp.unlink()
+            except FileNotFoundError:
+                pass
 
     def _verify_high_water(self) -> None:
-        if not self._events or not self.high_water_path:
+        if not self.high_water_path:
             return
 
         if not self.high_water_path.exists():
+            if self._events:
+                raise ContinuityVerificationError(
+                    "high-water anchor missing"
+                )
+            return
+
+        if not self._events:
             raise ContinuityVerificationError(
-                "high-water anchor missing"
+                "ledger empty while high-water anchor exists"
             )
 
         try:
             anchor = json.loads(
                 self.high_water_path.read_text(encoding="utf-8")
             )
+            if not isinstance(anchor, dict):
+                raise ValueError("anchor must be an object")
+            if anchor.get("schema") != self.VERSION:
+                raise ValueError("anchor schema mismatch")
+            anchor_sequence = anchor.get("event_sequence")
+            if (
+                isinstance(anchor_sequence, bool)
+                or not isinstance(anchor_sequence, int)
+                or anchor_sequence < 1
+            ):
+                raise ValueError("invalid anchor sequence")
+            anchor_hash = anchor.get("event_hash")
+            anchor_event_id = anchor.get("event_id")
+            if not isinstance(anchor_hash, str) or not anchor_hash:
+                raise ValueError("invalid anchor hash")
+            if not isinstance(anchor_event_id, str) or not anchor_event_id:
+                raise ValueError("invalid anchor event id")
         except Exception as exc:
             raise ContinuityVerificationError(
                 "invalid high-water anchor"
             ) from exc
 
         latest = self._events[-1]
-        anchor_sequence = int(anchor.get("event_sequence", 0))
-        anchor_hash = anchor.get("event_hash")
 
         if latest.event_sequence < anchor_sequence:
             raise ContinuityVerificationError(
@@ -101,19 +163,25 @@ class ContinuityLedger:
                 "ledger ahead of high-water anchor"
             )
 
-        if anchor_hash != latest.content_hash():
+        if (
+            anchor_hash != latest.content_hash()
+            or anchor_event_id != latest.event_id
+        ):
             raise ContinuityVerificationError(
-                "ledger rollback detected: latest event hash differs from high-water"
+                "ledger rollback detected: latest event differs from high-water"
             )
 
     def _append_disk(self, event: ContinuityEvent) -> None:
         if not self.path:
             return
-        line = json.dumps(event.as_dict(), sort_keys=True, ensure_ascii=False) + "\n"
+        line = json.dumps(
+            event.as_dict(), sort_keys=True, ensure_ascii=False
+        ) + "\n"
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
+        self._fsync_parent(self.path)
 
     def _sign(self, event: ContinuityEvent) -> None:
         if self.signer is not None:
@@ -135,6 +203,12 @@ class ContinuityLedger:
         state_hash: Optional[str] = None,
     ) -> ContinuityEvent:
         with self._lock:
+            if self._write_failed:
+                raise ContinuityVerificationError(
+                    "ledger writes disabled after persistence failure: "
+                    + str(self._write_failure_reason or "unknown error")
+                )
+
             previous = self._events[-1] if self._events else None
             sequence = previous.event_sequence + 1 if previous else 1
             event = ContinuityEvent(
@@ -146,19 +220,23 @@ class ContinuityLedger:
                 previous_event_hash=previous.content_hash() if previous else None,
                 state_hash=state_hash,
             )
-            # Materialize deterministic payload hash before signing or persisting.
             event.signing_bytes()
             self._sign(event)
             if not self._verify_signature(event):
                 raise ContinuityVerificationError("event signature verification failed")
             if previous and event.previous_event_hash != previous.content_hash():
                 raise ContinuityVerificationError("event chain construction failed")
+
             self._events.append(event)
             try:
                 self._append_disk(event)
                 self._write_high_water(event)
-            except Exception:
+            except Exception as exc:
                 self._events.pop()
+                self._write_failed = True
+                self._write_failure_reason = (
+                    f"{type(exc).__name__}: {exc}"
+                )
                 raise
             return event
 
@@ -167,7 +245,8 @@ class ContinuityLedger:
             return list(self._events)
 
     def latest(self) -> Optional[ContinuityEvent]:
-        return self._events[-1] if self._events else None
+        with self._lock:
+            return self._events[-1] if self._events else None
 
     def verify(self) -> bool:
         with self._lock:
@@ -183,8 +262,8 @@ class ContinuityLedger:
                     raise ContinuityVerificationError("event hash chain mismatch")
                 if not event.payload_hash:
                     raise ContinuityVerificationError("missing payload hash")
-                expected_payload_hash = __import__("hashlib").sha256(
-                    __import__("json").dumps(
+                expected_payload_hash = hashlib.sha256(
+                    json.dumps(
                         event.payload, sort_keys=True,
                         separators=(",", ":"), ensure_ascii=False
                     ).encode("utf-8")
@@ -199,7 +278,9 @@ class ContinuityLedger:
 
     def tamper_check(self) -> bool:
         try:
-            return self.verify()
+            self.verify()
+            self._verify_high_water()
+            return True
         except ContinuityVerificationError:
             return False
 

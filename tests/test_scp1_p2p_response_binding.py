@@ -1,185 +1,89 @@
+"""Client response binding checks over a real SCP-1 TCP handshake."""
+
 import hashlib
-import json
 
 import symbiont_core as core
+from core.crypto_protocol import SCP1
 from core.node_identity import NodeIdentity
-from core.crypto_protocol import SCP1, SCPReplayGuard
-from core.scp1_zerotrust import SCP1ZeroTrust
-from tsk import TrustedSecurityKernel
+
+from test_scp1_stage1b_live_tcp import _bind, _close, _live_pair
 
 
-class FakeCoreIdentity:
-    def id(self):
-        return "core-local-test-id"
-
-    def public_key(self):
-        return "test-core-public-key"
-
-    def sign(self, payload):
-        return "a" * 64
-
-    def verify(self, payload, signature, public_key):
-        return True
+def test_send_to_accepts_owner_confirmed_core_node_binding(tmp_path):
+    pair = _live_pair(tmp_path)
+    a, *_rest, b_core = pair
+    try:
+        response = a.send_to(b_core, {"action": "PING"})
+        assert response["status"] == "PONG"
+    finally:
+        _close(pair)
 
 
-class FakeSocket:
-    def __init__(self, response):
-        self.response = response
+def test_send_to_rejects_another_trusted_node_response(tmp_path, monkeypatch):
+    pair = _live_pair(tmp_path)
+    a, b, *_rest, _a_core, b_core = pair
+    rogue = NodeIdentity(tmp_path / "rogue-response.json")
+    rogue_core_id = "core-rogue-response"
+    rogue_core_key = "rogue-core-public-key"
 
-    def settimeout(self, timeout):
-        pass
-
-    def connect(self, address):
-        self.address = address
-
-    def sendall(self, data):
-        self.sent = data
-
-    def recv(self, size):
-        return json.dumps(self.response).encode("utf-8")
-
-    def close(self):
-        pass
-
-
-class FakeNode:
-    def __init__(self):
-        self.identity = FakeCoreIdentity()
-        self.peers = core.PeerDirectory()
-        self.tsk = None
-
-
-def make_scp_packet(identity, payload, nonce):
-    packet = SCP1.build_payload(
-        node_id=identity.node_id,
-        public_key=identity.public_key,
-        payload=payload,
-        nonce=nonce,
-        capability="network.send",
-        message_type="RESPONSE",
+    # Make the alternate signer independently trusted by the client's TSK.
+    _bind(a.node.tsk, rogue_core_id, rogue_core_key, rogue)
+    a.node.peers.upsert(
+        rogue_core_id,
+        rogue_core_key,
+        "127.0.0.1",
+        12346,
+        node_id=rogue.node_id,
+        node_public_key_fingerprint=hashlib.sha256(
+            rogue.public_key
+        ).hexdigest(),
     )
-    return SCP1.sign(identity.private_key, packet)
+    a._sync_scp1_trust()
 
-
-def make_network(tmp_path, monkeypatch, response, expected_node,
-                 core_id, core_public_key, trusted_nodes,
-                 *, bind=True, bound_core_key=None, nonce="response-nonce"):
-    local = NodeIdentity(tmp_path / "local.json")
-    node = FakeNode()
-    node.peers.upsert(
-        core_id, core_public_key, "127.0.0.1", 12345
-    )
-
-    tsk_root = tmp_path / "tsk"
-    node.tsk = TrustedSecurityKernel(root=tsk_root)
-
-    if bind:
-        bound_key = (
-            core_public_key if bound_core_key is None else bound_core_key
+    def rogue_response(payload, message_type="P2P"):
+        packet = SCP1.build_payload(
+            node_id=rogue.node_id,
+            public_key=rogue.public_key,
+            payload=payload,
+            capability="network.send",
+            message_type=message_type,
         )
-        core_fp = hashlib.sha256(bound_key.encode("utf-8")).hexdigest()
-        node_path = tmp_path / "expected-node.json"
-        # Use the same persisted NodeIdentity that the binding confirms.
-        expected_node_path = expected_node.path
-        node.tsk.confirm_core_node_binding(
-            core_id=core_id,
-            core_public_key_fingerprint=core_fp,
-            node_identity_path=expected_node_path,
-            owner_confirmation=f"BIND {core_id} TO NODE {expected_node.node_id}",
+        return {"scp1": SCP1.sign(rogue.private_key, packet)}
+
+    monkeypatch.setattr(b, "_scp1_wrap", rogue_response)
+    try:
+        # Rogue is trusted, but is not the peer authenticated in this session.
+        assert a.send_to(b_core, {"action": "PING"}) is None
+    finally:
+        _close(pair)
+
+
+def test_send_to_rejects_missing_owner_confirmed_binding(tmp_path):
+    pair = _live_pair(tmp_path)
+    a, *_rest, b_core = pair
+    try:
+        from tsk import TrustedSecurityKernel
+
+        a.node.tsk = TrustedSecurityKernel(root=tmp_path / "empty-client-tsk")
+        a._sync_scp1_trust()
+        assert a.send_to(b_core, {"action": "PING"}) is None
+    finally:
+        _close(pair)
+
+
+def test_send_to_rejects_mismatched_core_key_fingerprint(tmp_path):
+    pair = _live_pair(tmp_path)
+    a, b, *_rest, _a_core, b_core = pair
+    try:
+        peer = a.node.peers.get(b_core)
+        a.node.peers.upsert(
+            b_core,
+            "different-core-public-key",
+            peer.address,
+            peer.tcp_port,
+            node_id=peer.node_id,
+            node_public_key_fingerprint=peer.node_public_key_fingerprint,
         )
-        # Exercise persisted binding state, not just the original instance.
-        node.tsk = TrustedSecurityKernel(root=tsk_root)
-
-    network = core.P2PNetwork(node, scp_identity=local)
-    network.scp1_enabled = True
-    network.scp1 = SCP1ZeroTrust(
-        trusted_nodes=trusted_nodes,
-        replay_guard=SCPReplayGuard(tmp_path / "replay.json"),
-    )
-
-    fake_socket = FakeSocket(response)
-    monkeypatch.setattr(
-        core.socket, "socket", lambda *a, **kw: fake_socket
-    )
-    return network, core_id
-
-
-def test_send_to_accepts_owner_confirmed_core_node_binding(
-    tmp_path, monkeypatch
-):
-    expected_path = tmp_path / "expected.json"
-    expected = NodeIdentity(expected_path)
-    core_id = "core-expected"
-    core_key = "expected-core-public-key"
-    payload = {"status": "OK", "from": expected.node_id}
-    response = {"scp1": make_scp_packet(expected, payload, "nonce-valid")}
-
-    network, peer_id = make_network(
-        tmp_path, monkeypatch, response, expected,
-        core_id, core_key, [expected.node_id],
-    )
-
-    assert peer_id == core_id
-    assert network.send_to(peer_id, {"action": "TEST"}) == payload
-
-
-def test_send_to_rejects_another_trusted_node(
-    tmp_path, monkeypatch
-):
-    expected = NodeIdentity(tmp_path / "expected.json")
-    other = NodeIdentity(tmp_path / "other.json")
-    core_id = "core-expected"
-    core_key = "expected-core-public-key"
-    response = {
-        "scp1": make_scp_packet(
-            other, {"status": "FORGED"}, "nonce-wrong-node"
-        )
-    }
-
-    network, peer_id = make_network(
-        tmp_path, monkeypatch, response, expected,
-        core_id, core_key, [expected.node_id, other.node_id],
-    )
-
-    assert network.send_to(peer_id, {"action": "TEST"}) is None
-
-
-def test_send_to_rejects_missing_owner_confirmed_binding(
-    tmp_path, monkeypatch
-):
-    expected = NodeIdentity(tmp_path / "expected.json")
-    core_id = "core-without-binding"
-    core_key = "expected-core-public-key"
-    response = {
-        "scp1": make_scp_packet(
-            expected, {"status": "OK"}, "nonce-no-binding"
-        )
-    }
-
-    network, peer_id = make_network(
-        tmp_path, monkeypatch, response, expected,
-        core_id, core_key, [expected.node_id], bind=False,
-    )
-
-    assert network.send_to(peer_id, {"action": "TEST"}) is None
-
-
-def test_send_to_rejects_mismatched_core_key_fingerprint(
-    tmp_path, monkeypatch
-):
-    expected = NodeIdentity(tmp_path / "expected.json")
-    core_id = "core-wrong-fingerprint"
-    core_key = "expected-core-public-key"
-    response = {
-        "scp1": make_scp_packet(
-            expected, {"status": "OK"}, "nonce-wrong-fingerprint"
-        )
-    }
-
-    network, peer_id = make_network(
-        tmp_path, monkeypatch, response, expected,
-        core_id, core_key, [expected.node_id],
-        bound_core_key="different-core-public-key",
-    )
-
-    assert network.send_to(peer_id, {"action": "TEST"}) is None
+        assert a.send_to(b_core, {"action": "PING"}) is None
+    finally:
+        _close(pair)
