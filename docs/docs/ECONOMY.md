@@ -89,14 +89,17 @@ The escrow record stores information including:
 `release_quest()` transfers a reserved reward back into the wallet as a
 received amount and marks the escrow as `RELEASED`.
 
-A frozen escrow may also be released.
+A frozen escrow cannot be released through this refund path. A confirmed
+worker payment must be closed with `finalize_quest_payment()`; unresolved
+freezes require an explicit recovery decision.
 
 ### Refund
 
 `refund_quest()` returns the reserved reward to the wallet and marks the
 escrow as `REFUNDED`.
 
-A frozen escrow may also be refunded.
+A frozen escrow cannot be refunded automatically. It requires an explicit
+recovery decision after the payment state has been reconciled.
 
 ### Freeze
 

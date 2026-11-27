@@ -65,6 +65,8 @@ export SYMBIONT_SCP1_P2P=1
 
 Для SCP-1 должны быть настроены trusted nodes. Discovery и trust остаются разными понятиями.
 
+В Stage 1B взаимный TCP handshake выполняется до обработки P2P-операций. Для TSK-derived trust требуется owner-confirmed Core-to-Node binding и совпадение fingerprints. Явно заданные через `SYMBIONT_SCP1_TRUSTED_NODES` узлы остаются отдельным источником доверия. SCP-1 P2P не следует считать шифрованием TCP-трафика.
+
 ### SCA-1 Continuity Shadow
 
 ```bash

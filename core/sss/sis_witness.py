@@ -281,6 +281,26 @@ class PersistentWitness:
                 self.db.execute("ROLLBACK")
             raise
 
+    def abort(self, expected: Anchor, candidate: Anchor) -> str:
+        """Abort a prepared transition only while the trusted head is unchanged."""
+        self._validate(expected)
+        self._validate(candidate)
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            current = self.current
+            pending = self.pending
+            if current != expected:
+                raise WitnessError("Cannot abort after witness state advanced")
+            if pending != (expected, candidate):
+                raise WitnessError("Abort does not match prepared operation")
+            self.db.execute("DELETE FROM witness_pending WHERE id=1")
+            self.db.execute("COMMIT")
+            return "ABORTED"
+        except Exception:
+            if self.db.in_transaction:
+                self.db.execute("ROLLBACK")
+            raise
+
     def compare_local(self, local: Anchor) -> str:
         self._validate(local)
         current = self.current

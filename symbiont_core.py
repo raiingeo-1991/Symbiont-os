@@ -8,9 +8,12 @@ SYMBIONT CORE v11.0
 from __future__ import annotations
 
 import base64
+import copy
+from collections import deque
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import socket
@@ -20,6 +23,11 @@ import threading
 import time
 import urllib.request
 import uuid
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,8 +40,10 @@ except Exception:
 
 try:
     from core.continuity.shadow import ContinuityShadow
+    from core.sss.sis_witness import PersistentWitness
 except Exception:
     ContinuityShadow = None
+    PersistentWitness = None
 
 try:
     from core.sss.immune_memory import ImmuneMemory
@@ -104,6 +114,8 @@ SMSA_PERMISSION_MAP = {
     "sensor_read": "sensor.read",
     "location_read": "location.read",
     "network_send": "network.send",
+    "network_receive": "network.receive",
+    "payment_execute": "payment.execute",
     "file_write": "file.write",
     "external_ai": "external_ai.call",
     "task_execution": "task.execute",
@@ -167,6 +179,18 @@ def atomic_write(path: Path, data: str):
     with tmp.open("w", encoding="utf-8") as f:
         f.write(data); f.flush(); os.fsync(f.fileno())
     tmp.replace(path)
+    # Persist the directory entry update where the platform supports it.
+    directory_fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(str(path.parent), flags)
+        os.fsync(directory_fd)
+    except OSError:
+        # Some Android/filesystem combinations do not expose directory fsync.
+        pass
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 def clean_input(raw: str) -> str:
     raw = raw.strip()
@@ -243,23 +267,33 @@ def derive_identity(master_seed):
 # ============================================================
 
 class EventJournal:
+    """Append-only hash-chained journal that fails closed on corruption.
+
+    The hash chain detects accidental/tamper changes only when the attacker
+    cannot rewrite the complete chain. It is not a signature or trust anchor.
+    """
+
+    GENESIS_HASH = "0" * 64
+
     def __init__(self, path: Path):
-        self.path = path
+        self.path = Path(path)
         self.lock = threading.RLock()
         self._listeners = []
         self._listener_error_count = 0
         self._last_listener_error = None
+        self._integrity_error = None
+        self._verified_stat = None
+        self._event_count = 0
         self._last_event_hash = self._last_hash()
 
     def add_listener(self, listener, replay_existing=False):
-        """Register an observer, optionally replaying history atomically."""
+        """Register an observer, optionally replaying verified history."""
         with self.lock:
             if replay_existing:
                 valid, _ = self.verify()
                 if not valid:
                     raise ValueError(
-                        "Core EventJournal integrity check failed; "
-                        "refusing replay"
+                        "Core EventJournal integrity check failed; refusing replay"
                     )
                 for event in self.all_events():
                     listener(event)
@@ -267,35 +301,118 @@ class EventJournal:
             if listener not in self._listeners:
                 self._listeners.append(listener)
 
+    def _read_verified_events(self):
+        events = []
+        previous = self.GENESIS_HASH
+        if not self.path.exists():
+            return events
+        with self.path.open("r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise ValueError(
+                        f"Malformed EventJournal line {line_number}"
+                    ) from exc
+                if not isinstance(event, dict):
+                    raise ValueError(f"Invalid EventJournal record at line {line_number}")
+                if event.get("previous") != previous:
+                    raise ValueError(f"EventJournal chain break at line {line_number}")
+                saved_hash = event.get("hash")
+                unsigned = dict(event)
+                unsigned.pop("hash", None)
+                if not isinstance(saved_hash, str) or digest(unsigned) != saved_hash:
+                    raise ValueError(f"EventJournal hash mismatch at line {line_number}")
+                previous = saved_hash
+                events.append(event)
+        return events
+
     def _last_hash(self):
-        if not self.path.exists(): return "0" * 64
-        last = ""
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip(): last = line.strip()
-        if not last: return "0" * 64
-        try: return str(json.loads(last).get("hash", "0" * 64))
-        except Exception: return "0" * 64
+        try:
+            events = self._read_verified_events()
+            self._event_count = len(events)
+            self._verified_stat = self._stat_signature()
+        except (OSError, ValueError) as exc:
+            self._integrity_error = f"{type(exc).__name__}: {exc}"
+            return self.GENESIS_HASH
+        return events[-1].get("hash", self.GENESIS_HASH) if events else self.GENESIS_HASH
+
+    def _stat_signature(self):
+        try:
+            stat = self.path.stat()
+            # Detect ordinary in-place rewrites even when size and mtime are restored.
+            return (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000)),
+            )
+        except FileNotFoundError:
+            return (0, 0)
+
+    def _process_lock(self, exclusive=True):
+        """Return an OS-level lock context for cooperating processes."""
+        class _Lock:
+            def __init__(self, path, exclusive):
+                self.path = path
+                self.exclusive = exclusive
+                self.stream = None
+            def __enter__(self):
+                if fcntl is not None:
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    self.stream = self.path.open("a+")
+                    mode = fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH
+                    fcntl.flock(self.stream.fileno(), mode)
+                return self
+            def __exit__(self, exc_type, exc, tb):
+                if self.stream is not None:
+                    try:
+                        fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+                    finally:
+                        self.stream.close()
+        return _Lock(self.path.with_suffix(self.path.suffix + ".lock"), exclusive)
 
     def append(self, event_type, payload):
-        with self.lock:
-            prev = self._last_event_hash
-            event = {"event_id": uuid.uuid4().hex, "time": now_iso(),
-                     "type": event_type, "payload": payload, "previous": prev}
+        with self.lock, self._process_lock(exclusive=True):
+            # Refresh from disk while holding the process lock. This prevents
+            # two independent Core processes from appending the same predecessor.
+            current_stat = self._stat_signature()
+            if self._integrity_error is not None or self._verified_stat != current_stat:
+                try:
+                    events = self._read_verified_events()
+                    self._last_event_hash = events[-1]["hash"] if events else self.GENESIS_HASH
+                    self._event_count = len(events)
+                    self._verified_stat = self._stat_signature()
+                    self._integrity_error = None
+                except (OSError, ValueError) as exc:
+                    self._integrity_error = f"{type(exc).__name__}: {exc}"
+                    raise ValueError(
+                        "EventJournal is corrupt; append disabled: " + self._integrity_error
+                    ) from exc
+            event = {
+                "event_id": uuid.uuid4().hex,
+                "time": now_iso(),
+                "type": event_type,
+                "payload": payload,
+                "previous": self._last_event_hash,
+            }
             event["hash"] = digest(event)
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as f:
-                f.write(canonical_json(event) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            with self.path.open("a", encoding="utf-8") as stream:
+                stream.write(canonical_json(event) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
 
             self._last_event_hash = event["hash"]
-
+            self._event_count += 1
+            self._verified_stat = self._stat_signature()
             for listener in tuple(self._listeners):
                 try:
                     listener(event)
                 except Exception as exc:
-                    # Observer failures are visible, but must never break Core.
                     self._listener_error_count += 1
                     self._last_listener_error = {
                         "listener": getattr(listener, "__qualname__", type(listener).__name__),
@@ -304,33 +421,41 @@ class EventJournal:
                         "error_type": type(exc).__name__,
                         "message": str(exc),
                     }
-
             return event
 
     def verify(self):
-        if not self.path.exists(): return True, 0
-        prev = "0" * 64; count = 0
-        with self.lock:
-            with self.path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.strip(): continue
-                    event = json.loads(line)
-                    if event.get("previous") != prev: return False, count
-                    saved = event.get("hash"); c = dict(event); c.pop("hash", None)
-                    if digest(c) != saved: return False, count
-                    prev = saved; count += 1
-        return True, count
+        with self.lock, self._process_lock(exclusive=False):
+            current_stat = self._stat_signature()
+            if (
+                self._integrity_error is None
+                and self._verified_stat == current_stat
+            ):
+                return True, self._event_count
+            try:
+                events = self._read_verified_events()
+            except (OSError, ValueError) as exc:
+                self._integrity_error = f"{type(exc).__name__}: {exc}"
+                return False, 0
+            self._integrity_error = None
+            self._event_count = len(events)
+            self._last_event_hash = events[-1]["hash"] if events else self.GENESIS_HASH
+            self._verified_stat = self._stat_signature()
+            return True, self._event_count
 
     def all_events(self):
-        events = []
-        if not self.path.exists(): return events
-        with self.lock:
-            with self.path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        try: events.append(json.loads(line))
-                        except Exception: pass
-        return events
+        with self.lock, self._process_lock(exclusive=False):
+            try:
+                events = self._read_verified_events()
+            except (OSError, ValueError) as exc:
+                self._integrity_error = f"{type(exc).__name__}: {exc}"
+                raise ValueError(
+                    "EventJournal integrity check failed; refusing partial history"
+                ) from exc
+            self._integrity_error = None
+            self._event_count = len(events)
+            self._last_event_hash = events[-1]["hash"] if events else self.GENESIS_HASH
+            self._verified_stat = self._stat_signature()
+            return events
 
 
 # ============================================================
@@ -618,6 +743,7 @@ class MemoryVault:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self._outbox_needs_reconcile = True
         self._initialize()
 
     def _initialize(self):
@@ -647,6 +773,11 @@ class MemoryVault:
                 );
                 CREATE TABLE IF NOT EXISTS ambient_log (
                     ambient_id TEXT PRIMARY KEY, text TEXT NOT NULL, created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS journal_outbox (
+                    outbox_id TEXT PRIMARY KEY, event_type TEXT NOT NULL,
+                    payload TEXT NOT NULL, created_at TEXT NOT NULL,
+                    delivered INTEGER NOT NULL DEFAULT 0
                 );
             """)
             self.db.commit(); self._migrate()
@@ -697,6 +828,54 @@ class MemoryVault:
                 except Exception:
                     self.fts_available = False
             self.db.commit()
+        self._flush_journal_outbox()
+
+    def _flush_journal_outbox(self, reconcile=False):
+        """Deliver committed memory events; scan history only during recovery."""
+        self.last_outbox_error = None
+        with self.lock:
+            pending = self.db.execute(
+                "SELECT outbox_id, event_type, payload FROM journal_outbox "
+                "WHERE delivered = 0 ORDER BY created_at, outbox_id"
+            ).fetchall()
+        if not pending:
+            self._outbox_needs_reconcile = False
+            return
+        try:
+            existing_memory_ids = set()
+            if reconcile or self._outbox_needs_reconcile:
+                valid, _ = self.journal.verify()
+                if not valid:
+                    raise ValueError("EventJournal integrity check failed")
+                existing_memory_ids = {
+                    str(event.get("payload", {}).get("memory_id"))
+                    for event in self.journal.all_events()
+                    if event.get("type") == "memory.created"
+                    and isinstance(event.get("payload"), dict)
+                }
+            with self.lock:
+                for row in pending:
+                    payload = json.loads(row["payload"])
+                    memory_id = str(payload.get("memory_id", ""))
+                    if memory_id not in existing_memory_ids:
+                        self.journal.append(row["event_type"], payload)
+                        existing_memory_ids.add(memory_id)
+                    self.db.execute(
+                        "UPDATE journal_outbox SET delivered = 1 WHERE outbox_id = ?",
+                        (row["outbox_id"],),
+                    )
+                self.db.commit()
+            self._outbox_needs_reconcile = False
+        except Exception as exc:
+            self._outbox_needs_reconcile = True
+            self.last_outbox_error = f"{type(exc).__name__}: {exc}"
+
+    def journal_outbox_status(self):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS pending FROM journal_outbox WHERE delivered = 0"
+            ).fetchone()
+        return {"pending": int(row["pending"]), "last_error": self.last_outbox_error}
 
     def _decay(self, row):
         try: imp = float(row["importance"]); rc = float(row["recall_count"] or 0) * RECALL_BOOST
@@ -723,11 +902,20 @@ class MemoryVault:
                         "INSERT INTO memory_fts(memory_id, text, kind, project, tags, metadata) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
                         (mem_id, text.strip(), kind, project or "", tags_json, metadata_json))
+                event_payload = {
+                    "memory_id": mem_id, "kind": kind, "importance": importance
+                }
+                self.db.execute(
+                    "INSERT INTO journal_outbox "
+                    "(outbox_id, event_type, payload, created_at, delivered) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    (mem_id, "memory.created", json.dumps(event_payload, ensure_ascii=False), ts),
+                )
                 self.db.commit()
             except Exception:
                 self.db.rollback()
                 raise
-        self.journal.append("memory.created", {"memory_id": mem_id, "kind": kind, "importance": importance})
+        self._flush_journal_outbox()
         return mem_id
 
     def mark_recall(self, memory_id):
@@ -2214,6 +2402,46 @@ class P2PNetwork:
 
         self._beacon_seen = {}
         self._beacon_seen_lock = threading.RLock()
+        self._source_rate = {}
+        self._source_rate_lock = threading.RLock()
+        self._source_rate_max_entries = 2048
+        self._tcp_slots = threading.BoundedSemaphore(
+            max(1, int(os.getenv("SYMBIONT_P2P_MAX_CONNECTIONS", "32")))
+        )
+        self._tcp_rate_limit = max(1, int(os.getenv("SYMBIONT_P2P_TCP_RATE", "12")))
+        self._udp_rate_limit = max(1, int(os.getenv("SYMBIONT_P2P_UDP_RATE", "60")))
+        self._rate_window_seconds = 60.0
+
+    def _allow_source(self, address, channel="tcp"):
+        """Bound unauthenticated work per source before protocol parsing."""
+        host = str(address[0] if isinstance(address, tuple) else address or "unknown")
+        limit = self._udp_rate_limit if channel == "udp" else self._tcp_rate_limit
+        now = time.monotonic()
+        key = (channel, host)
+        with self._source_rate_lock:
+            cutoff = now - self._rate_window_seconds
+            hits = self._source_rate.get(key)
+            if hits is None:
+                # Never grow beyond the hard cap. Reclaim expired entries when
+                # a new source needs a slot; unknown sources fail closed if full.
+                if len(self._source_rate) >= self._source_rate_max_entries:
+                    stale = [
+                        stale_key for stale_key, values in self._source_rate.items()
+                        if not values or values[-1] <= cutoff
+                    ]
+                    for stale_key in stale:
+                        self._source_rate.pop(stale_key, None)
+                if len(self._source_rate) >= self._source_rate_max_entries:
+                    return False
+                hits = deque()
+                self._source_rate[key] = hits
+
+            while hits and hits[0] <= cutoff:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now)
+            return True
 
     def _sync_scp1_trust(self):
         """Synchronize ENV trust and strictly validated TSK-derived trust."""
@@ -2677,6 +2905,8 @@ class P2PNetwork:
             while self.running and not self._stop_event.is_set():
                 try:
                     data, addr = sock.recvfrom(4096)
+                    if not self._allow_source(addr, channel="udp"):
+                        continue
                     wire = json.loads(data.decode("utf-8"))
 
                     verified = self._verify_beacon_wire(wire)
@@ -2777,15 +3007,24 @@ class P2PNetwork:
                 try:
                     conn, addr = sock.accept()
 
+                    if not self._allow_source(addr, channel="tcp"):
+                        conn.close()
+                        continue
+                    if not self._tcp_slots.acquire(blocking=False):
+                        conn.close()
+                        continue
                     if not self._register_socket(conn):
+                        self._tcp_slots.release()
+                        conn.close()
                         continue
 
                     if not self._spawn_worker(
                         self._handle_tcp,
-                        args=(conn, addr),
+                        args=(conn, addr, True),
                         name="Symbiont-P2P-TCP-Client",
                     ):
                         self._unregister_socket(conn)
+                        self._tcp_slots.release()
                         conn.close()
 
                 except socket.timeout:
@@ -2878,7 +3117,7 @@ class P2PNetwork:
         except Exception:
             return None
 
-    def _handle_tcp(self, conn, addr):
+    def _handle_tcp(self, conn, addr, slot_acquired=False):
         try:
             if not self.scp1_enabled:
                 conn.sendall(canonical_json({
@@ -2916,6 +3155,7 @@ class P2PNetwork:
                 and bool(action)
                 and envelope.get("type") == action
                 and envelope.get("capability") == "network.send"
+                and self.node.permissions.check("network_receive")
                 and req.get("sender") == peer_id
                 and req.get("session_id") == handshake.session_id
                 and self._scp1_verified_peer(peer_id, signer) is not None
@@ -3010,6 +3250,11 @@ class P2PNetwork:
                 conn.close()
             except Exception:
                 pass
+            if slot_acquired:
+                try:
+                    self._tcp_slots.release()
+                except ValueError:
+                    pass
 
     def send_to(self, peer_id, packet):
         if (
@@ -3018,6 +3263,10 @@ class P2PNetwork:
             or NodeHandshake is None
             or not isinstance(packet, dict)
         ):
+            return None
+
+        permissions = getattr(self.node, "permissions", None)
+        if permissions is None or not permissions.check("network_send"):
             return None
 
         peer = self.node.peers.get(peer_id)
@@ -3167,6 +3416,85 @@ class Quest:
 class QuestBoard:
     def __init__(self, node):
         self.node = node; self.lock = threading.RLock(); self.quests: Dict[str, Quest] = {}
+        self._incoming_lock = threading.RLock()
+        self._incoming_status = {}
+        self._incoming_history_error = None
+        journal_path = getattr(self.node.journal, "path", None)
+        self._incoming_db_path = (
+            Path(str(journal_path) + ".incoming.sqlite3")
+            if journal_path is not None else None
+        )
+        try:
+            if self._incoming_db_path is None:
+                raise RuntimeError("durable quest claim storage requires a file-backed EventJournal")
+            self._incoming_db_path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(str(self._incoming_db_path), timeout=15.0) as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA synchronous=FULL")
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS incoming_quests ("
+                    "quest_id TEXT PRIMARY KEY, "
+                    "status TEXT NOT NULL CHECK(status IN ('started','done')), "
+                    "updated_at TEXT NOT NULL)"
+                )
+                db.commit()
+            self._sync_incoming_status_from_journal()
+        except Exception as exc:
+            self._incoming_history_error = f"{type(exc).__name__}: {exc}"
+
+    def _sync_incoming_status_from_journal(self):
+        events = self.node.journal.all_events()
+        with sqlite3.connect(str(self._incoming_db_path), timeout=15.0) as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("BEGIN IMMEDIATE")
+            for event in events:
+                payload = event.get("payload", {})
+                quest_id = str(payload.get("quest_id", "")) if isinstance(payload, dict) else ""
+                if not quest_id:
+                    continue
+                event_type = event.get("type")
+                status = "started" if event_type == "quest.incoming.started" else (
+                    "done" if event_type == "quest.incoming.done" else None
+                )
+                if status:
+                    db.execute(
+                        "INSERT INTO incoming_quests(quest_id,status,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(quest_id) DO UPDATE SET "
+                        "status=CASE WHEN excluded.status='done' THEN 'done' "
+                        "ELSE incoming_quests.status END, updated_at=excluded.updated_at",
+                        (quest_id, status, now_iso()),
+                    )
+            db.commit()
+
+    def _claim_incoming_quest(self, quest_id):
+        """Atomically claim a quest across threads and independent processes."""
+        with sqlite3.connect(str(self._incoming_db_path), timeout=15.0) as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status FROM incoming_quests WHERE quest_id=?", (str(quest_id),)
+            ).fetchone()
+            if row is not None:
+                status = row[0]
+                if status not in {"started", "done"}:
+                    raise ValueError("invalid durable incoming quest status")
+                db.commit()
+                return status
+            db.execute(
+                "INSERT INTO incoming_quests(quest_id,status,updated_at) VALUES(?,?,?)",
+                (str(quest_id), "started", now_iso()),
+            )
+            db.commit()
+            return None
+
+    def _complete_incoming_quest(self, quest_id):
+        with sqlite3.connect(str(self._incoming_db_path), timeout=15.0) as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute(
+                "UPDATE incoming_quests SET status='done', updated_at=? WHERE quest_id=?",
+                (now_iso(), str(quest_id)),
+            )
+            db.commit()
 
     def create(self, title, description, reward, creator, required_rank=""):
         if reward < 0: raise ValueError("Reward >= 0")
@@ -3266,10 +3594,41 @@ class QuestBoard:
         return q, "Пир недоступен"
 
     def handle_incoming(self, packet):
+        # Serialize claim/check/execute within this Core process. The durable
+        # started event makes a crash fail closed rather than execute twice.
+        with self._incoming_lock:
+            return self._handle_incoming_locked(packet)
+
+    def _handle_incoming_locked(self, packet):
+        if not self.node.permissions.check("task_execution"):
+            return {
+                "status": "REJECTED",
+                "reason": "task_execution_permission_denied",
+                "worker": self.node.identity.id(),
+                "battery": None,
+            }
+        if not isinstance(packet, dict):
+            return {"status": "REJECTED", "reason": "invalid_quest_packet"}
+
         quest_id = packet.get("quest_id")
         desc = packet.get("description", "")
-        reward = float(packet.get("reward", 0))
+        raw_reward = packet.get("reward", 0)
         sender = packet.get("sender")
+
+        if not isinstance(quest_id, str) or not quest_id.strip() or len(quest_id) > 128:
+            return {"status": "REJECTED", "reason": "invalid_quest_id"}
+        if not isinstance(sender, str) or not sender:
+            return {"status": "REJECTED", "reason": "invalid_quest_sender"}
+        if not isinstance(desc, str) or not desc.strip() or len(desc) > 10000:
+            return {"status": "REJECTED", "reason": "invalid_quest_description"}
+        if isinstance(raw_reward, bool):
+            return {"status": "REJECTED", "reason": "invalid_quest_reward"}
+        try:
+            reward = float(raw_reward)
+        except (TypeError, ValueError, OverflowError):
+            return {"status": "REJECTED", "reason": "invalid_quest_reward"}
+        if not math.isfinite(reward) or reward <= 0:
+            return {"status": "REJECTED", "reason": "invalid_quest_reward"}
 
         batt = self.node.bodies.battery()
         if batt is None:
@@ -3296,27 +3655,59 @@ class QuestBoard:
                 "battery": batt,
             }
 
-        # Replay guard: EventJournal is the existing persistent source
-        # of truth for completed incoming quests.
-        if quest_id:
-            for event in self.node.journal.all_events():
-                if (
-                    event.get("type") == "quest.incoming.done"
-                    and str(event.get("payload", {}).get("quest_id")) == str(quest_id)
-                ):
-                    return {
-                        "status": "REPLAYED",
-                        "quest_id": quest_id,
-                        "worker": self.node.identity.id(),
-                        "battery": batt,
-                    }
+        # Durable at-most-once claim. A crash after STARTED is not retried
+        # automatically; manual recovery is safer than duplicate execution.
+        if self._incoming_history_error is not None:
+            return {
+                "status": "REJECTED",
+                "reason": "quest_history_unavailable",
+                "worker": self.node.identity.id(),
+                "battery": batt,
+            }
+        if not quest_id:
+            return {
+                "status": "REJECTED",
+                "reason": "missing_quest_id",
+                "worker": self.node.identity.id(),
+                "battery": batt,
+            }
+        try:
+            prior_status = self._claim_incoming_quest(quest_id)
+        except Exception as exc:
+            self._incoming_history_error = f"{type(exc).__name__}: {exc}"
+            return {
+                "status": "REJECTED", "reason": "quest_claim_storage_unavailable",
+                "worker": self.node.identity.id(), "battery": batt,
+            }
+        if prior_status == "done":
+            return {
+                "status": "REPLAYED", "quest_id": quest_id,
+                "worker": self.node.identity.id(), "battery": batt,
+            }
+        if prior_status == "started":
+            return {
+                "status": "IN_PROGRESS_OR_RECOVERY_REQUIRED",
+                "quest_id": quest_id,
+                "worker": self.node.identity.id(), "battery": batt,
+            }
 
+        try:
+            self.node.journal.append(
+                "quest.incoming.started",
+                {"quest_id": quest_id, "from": sender},
+            )
+        except Exception:
+            # The durable SQLite claim remains started: fail closed on retry.
+            raise
+        self._incoming_status[str(quest_id)] = "started"
         result = self.node.mind.think(desc)
         self.node.memory.remember(
             f"Выполнен квест от {sender[:12]}: {packet.get('title')}",
             kind="quest", importance=6, source="p2p")
         self.node.journal.append("quest.incoming.done",
                                  {"quest_id": quest_id, "from": sender, "reward": reward})
+        self._complete_incoming_quest(quest_id)
+        self._incoming_status[str(quest_id)] = "done"
         return {"status": "COMPLETED", "result": result["response"][:1000],
                 "worker": self.node.identity.id(), "battery": batt}
 
@@ -3337,7 +3728,20 @@ class Wallet:
 class Economy:
     def __init__(self, path, journal):
         self.path = path; self.journal = journal; self.lock = threading.RLock()
-        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self.mint_operations = {}; self._load()
+        self.wallet = Wallet(); self.last_food = None; self.escrow = {}; self.payments = {}; self.mint_operations = {}
+        self.journal_outbox = []; self.last_outbox_error = None
+        self._outbox_needs_reconcile = True
+        self._execution_proofs = {}
+        self._journal_index_error = None
+        self._load()
+        # Last successfully persisted state is the rollback point for failed
+        # atomic writes. Mutators update memory before calling _save().
+        self._persisted_state = self._snapshot_state()
+        self._flush_journal_outbox(reconcile=True)
+        try:
+            self.journal.add_listener(self._index_journal_event, replay_existing=True)
+        except Exception as exc:
+            self._journal_index_error = f"{type(exc).__name__}: {exc}"
 
     def _load(self):
         if not self.path.exists():
@@ -3393,6 +3797,15 @@ class Economy:
         escrow = data.get("escrow", {})
         payments = data.get("payments", {})
         mint_operations = data.get("mint_operations", {})
+        journal_outbox = data.get("journal_outbox", [])
+        if not isinstance(journal_outbox, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("outbox_id"), str)
+            or not isinstance(item.get("event_type"), str)
+            or not isinstance(item.get("payload"), dict)
+            for item in journal_outbox
+        ):
+            raise EconomyStateError("Economy journal_outbox must be a list of valid events")
         if not isinstance(escrow, dict):
             raise EconomyStateError("Economy escrow must be an object")
         if not isinstance(payments, dict):
@@ -3419,14 +3832,100 @@ class Economy:
         self.escrow = escrow
         self.payments = payments
         self.mint_operations = mint_operations
+        self.journal_outbox = journal_outbox
+
+
+    def _index_journal_event(self, event):
+        if event.get("type") != "quest.incoming.done":
+            return
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return
+        quest_id = str(payload.get("quest_id", ""))
+        if quest_id:
+            self._execution_proofs.setdefault(quest_id, []).append(event)
+
+    def _snapshot_state(self):
+        return {
+            "wallet": asdict(self.wallet),
+            "last_food_allocation": self.last_food,
+            "escrow": copy.deepcopy(self.escrow),
+            "payments": copy.deepcopy(self.payments),
+            "mint_operations": copy.deepcopy(self.mint_operations),
+            "journal_outbox": copy.deepcopy(self.journal_outbox),
+        }
+
+    def _restore_persisted_state(self):
+        snapshot = copy.deepcopy(self._persisted_state)
+        self.wallet = Wallet(**snapshot["wallet"])
+        self.last_food = snapshot["last_food_allocation"]
+        self.escrow = snapshot["escrow"]
+        self.payments = snapshot["payments"]
+        self.mint_operations = snapshot["mint_operations"]
+        self.journal_outbox = snapshot["journal_outbox"]
 
     def _save(self):
-        atomic_write(self.path, json.dumps({
+        data = {
             "wallet": asdict(self.wallet),
             "last_food_allocation": self.last_food,
             "currency": CURRENCY,
-            "escrow": self.escrow, "payments": self.payments,
-            "mint_operations": self.mint_operations}, ensure_ascii=False, indent=2))
+            "escrow": self.escrow,
+            "payments": self.payments,
+            "mint_operations": self.mint_operations,
+            "journal_outbox": self.journal_outbox,
+        }
+        try:
+            atomic_write(
+                self.path,
+                json.dumps(data, ensure_ascii=False, indent=2),
+            )
+        except Exception:
+            # Keep the live Economy consistent with the last durable state.
+            self._restore_persisted_state()
+            raise
+        self._persisted_state = self._snapshot_state()
+
+    def _commit_event(self, event_type, payload):
+        """Persist state and an outbox record before delivering the journal event."""
+        outbox_id = uuid.uuid4().hex
+        event_payload = dict(payload)
+        event_payload["_outbox_id"] = outbox_id
+        self.journal_outbox.append({
+            "outbox_id": outbox_id,
+            "event_type": str(event_type),
+            "payload": event_payload,
+        })
+        self._save()
+        self._flush_journal_outbox()
+
+    def _flush_journal_outbox(self, reconcile=False):
+        self.last_outbox_error = None
+        if not self.journal_outbox:
+            self._outbox_needs_reconcile = False
+            return True
+        try:
+            delivered = set()
+            if reconcile or self._outbox_needs_reconcile:
+                valid, _ = self.journal.verify()
+                if not valid:
+                    raise ValueError("EventJournal integrity check failed")
+                delivered = {
+                    str(event.get("payload", {}).get("_outbox_id"))
+                    for event in self.journal.all_events()
+                    if isinstance(event.get("payload"), dict)
+                }
+            for item in self.journal_outbox:
+                if item["outbox_id"] not in delivered:
+                    self.journal.append(item["event_type"], item["payload"])
+                delivered.add(item["outbox_id"])
+            self.journal_outbox = []
+            self._save()
+            self._outbox_needs_reconcile = False
+            return True
+        except Exception as exc:
+            self._outbox_needs_reconcile = True
+            self.last_outbox_error = f"{type(exc).__name__}: {exc}"
+            return False
 
     def credit(self, amount, reason):
         amount = float(amount)
@@ -3434,8 +3933,7 @@ class Economy:
         with self.lock:
             self.wallet.balance += amount
             self.wallet.lifetime_received += amount
-            self._save()
-            self.journal.append("economy.credit", {"amount": amount, "reason": reason})
+            self._commit_event("economy.credit", {"amount": amount, "reason": reason})
 
     def debit(self, amount, reason):
         amount = float(amount)
@@ -3444,8 +3942,7 @@ class Economy:
             if amount > self.wallet.balance: return False
             self.wallet.balance -= amount
             self.wallet.lifetime_spent += amount
-            self._save()
-            self.journal.append("economy.debit", {"amount": amount, "reason": reason})
+            self._commit_event("economy.debit", {"amount": amount, "reason": reason})
             return True
 
     def allocate_food(self):
@@ -3454,9 +3951,9 @@ class Economy:
             if self.last_food == today: return False
             self.wallet.balance += DEFAULT_FOOD_BUDGET
             self.wallet.lifetime_received += DEFAULT_FOOD_BUDGET
-            self.last_food = today; self._save()
-            self.journal.append("economy.food_allocation",
-                                {"amount": DEFAULT_FOOD_BUDGET, "date": today})
+            self.last_food = today
+            self._commit_event("economy.food_allocation",
+                               {"amount": DEFAULT_FOOD_BUDGET, "date": today})
             return True
 
     def reserve_quest(self, quest_id, reward, creator_node="", worker_node="",
@@ -3493,8 +3990,7 @@ class Economy:
             }
 
             self.escrow[quest_id] = tx
-            self._save()
-            self.journal.append("economy.escrow_reserved", tx)
+            self._commit_event("economy.escrow_reserved", tx)
 
             return True
 
@@ -3506,7 +4002,11 @@ class Economy:
             if not tx:
                 return False
 
-            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+            # A frozen escrow may represent an uncertain or disputed payment.
+            # Releasing it here would credit the creator even if the worker has
+            # already received payment. Resolve confirmed worker payments via
+            # finalize_quest_payment(); do not unfreeze through this refund path.
+            if tx.get("escrow_state") != "ESCROW":
                 return False
 
             reward = float(tx.get("reward", 0))
@@ -3521,8 +4021,7 @@ class Economy:
             self.wallet.balance += reward
             self.wallet.lifetime_received += reward
 
-            self._save()
-            self.journal.append(
+            self._commit_event(
                 "economy.escrow_released",
                 {
                     "quest_id": quest_id,
@@ -3541,7 +4040,9 @@ class Economy:
             if not tx:
                 return False
 
-            if tx.get("escrow_state") not in {"ESCROW", "FROZEN"}:
+            # A frozen escrow represents a dispute/uncertain settlement.
+            # It cannot be unilaterally refunded through this API.
+            if tx.get("escrow_state") != "ESCROW":
                 return False
 
             reward = float(tx.get("reward", 0))
@@ -3554,8 +4055,7 @@ class Economy:
 
             self.wallet.balance += reward
 
-            self._save()
-            self.journal.append(
+            self._commit_event(
                 "economy.escrow_refunded",
                 {
                     "quest_id": quest_id,
@@ -3582,8 +4082,7 @@ class Economy:
             tx["freeze_reason"] = reason
             tx["frozen_at"] = now_iso()
 
-            self._save()
-            self.journal.append(
+            self._commit_event(
                 "economy.escrow_frozen",
                 {
                     "quest_id": quest_id,
@@ -3619,8 +4118,7 @@ class Economy:
             tx["released_at"] = now_iso()
             tx["payment_finalized"] = True
 
-            self._save()
-            self.journal.append(
+            self._commit_event(
                 "economy.escrow_payment_finalized",
                 {
                     "quest_id": quest_id,
@@ -3653,27 +4151,17 @@ class Economy:
             if not quest_id:
                 return False
 
-            # Reject payments if the event journal cannot be verified.
+            # The index is populated from verified history once at startup
+            # and maintained by the EventJournal listener.
+            if self._journal_index_error is not None:
+                return False
             try:
                 journal_valid, _ = self.journal.verify()
             except Exception:
                 return False
-
             if not journal_valid:
                 return False
-
-            # Worker-side source of truth:
-            # the existing persistent execution proof.
-            execution_events = [
-                event
-                for event in self.journal.all_events()
-                if (
-                    event.get("type") == "quest.incoming.done"
-                    and str(
-                        event.get("payload", {}).get("quest_id")
-                    ) == quest_id
-                )
-            ]
+            execution_events = list(self._execution_proofs.get(quest_id, []))
 
             # Exactly one execution proof is required.
             # Zero means the Quest was never executed.
@@ -3737,9 +4225,7 @@ class Economy:
             self.wallet.lifetime_received += execution_reward
             self.payments[quest_id] = receipt
 
-            self._save()
-
-            self.journal.append(
+            self._commit_event(
                 "economy.payment_received",
                 {
                     "quest_id": quest_id,
@@ -3774,6 +4260,8 @@ class PermissionGate:
         "device_notify": False,
         "device_vibrate": False,
         "network_send": False,
+        "network_receive": False,
+        "payment_execute": False,
         "file_write": True,
         "external_ai": False,
         "task_execution": False,
@@ -4003,10 +4491,20 @@ class Symbiont:
                     "NodeIdentity unavailable; SCA-1 Shadow remains disabled"
                 )
             else:
+                witness = None
                 try:
+                    if os.getenv("SYMBIONT_SCA1_WITNESS", "0").strip().lower() in {
+                        "1", "true", "yes", "on"
+                    }:
+                        if PersistentWitness is None:
+                            raise RuntimeError("PersistentWitness unavailable")
+                        witness = PersistentWitness(
+                            self.root / "sca1_witness.sqlite3"
+                        )
                     candidate_shadow = ContinuityShadow(
                         self.root,
                         self.scp_identity,
+                        witness=witness,
                     )
                     self.journal.add_listener(
                         candidate_shadow.on_core_event,
@@ -4014,6 +4512,11 @@ class Symbiont:
                     )
                     self.continuity_shadow = candidate_shadow
                 except Exception as exc:
+                    if witness is not None:
+                        try:
+                            witness.close()
+                        except Exception:
+                            pass
                     self.continuity_shadow_error = (
                         f"{type(exc).__name__}: {exc}"
                     )
@@ -4311,8 +4814,20 @@ class Symbiont:
             # EventJournal isolates observer failures; expose them on Core.
             self.immune_memory_error = f"{type(exc).__name__}: {exc}"
 
-    def run_immunity_scan(self):
-        """Run a controlled scan; never apply source patches."""
+    def run_immunity_scan(
+        self,
+        *,
+        candidate_patch=None,
+        allowed_files=None,
+        test_paths=None,
+        support_files=None,
+        timeout_seconds=120,
+        allow_local_candidate_execution=False,
+    ):
+        """Run discovery/reproduction and optionally evaluate a patch in copies.
+
+        Candidate patches are never applied to the live project tree.
+        """
         from datetime import datetime, timezone
         import hashlib
         import json
@@ -4323,8 +4838,20 @@ class Symbiont:
             "patches_applied": False,
             "memory_recorded": False,
             "sis_anchored": False,
+            "candidate_evaluated": False,
+            "candidate_accepted": None,
+            "candidate_memory_recorded": False,
+            "candidate_sis_anchored": False,
+            "candidate_result": None,
             "errors": [],
         }
+        candidate_requested = candidate_patch is not None
+
+        if candidate_requested and (not allowed_files or not test_paths):
+            report["errors"].append(
+                "Candidate evaluation requires allowed_files and test_paths"
+            )
+            return report
 
         if ImmuneCycle is None:
             report["errors"].append("ImmuneCycle import unavailable")
@@ -4351,8 +4878,17 @@ class Symbiont:
                 finding["source_sha256"] = discovery.get("source_sha256", "")
 
             if finding is None:
-                report["result"] = "no_matching_candidate_found"
-            else:
+                # The vulnerable ordering has been replaced by a durable outbox.
+                # Verify the mitigation under an injected failure instead.
+                finding = {
+                    "rule_id": "ECONOMY-OUTBOX-RECOVERY",
+                    "method": "credit",
+                    "status": "mitigation_candidate",
+                    "reason": "Economy persists a journal outbox before delivery.",
+                    "source_sha256": discovery.get("source_sha256", ""),
+                }
+
+            if finding is not None:
                 reproduction = cycle.reproduce_credit_journal_failure()
                 report["reproduction"] = reproduction
 
@@ -4410,6 +4946,47 @@ class Symbiont:
                             report["errors"].append("SISIntegrity unavailable")
 
                     report["result"] = "reproduction_confirmed"
+
+                    # Candidate evaluation is gated by successful reproduction.
+                    if candidate_requested:
+                        try:
+                            evaluation = cycle.evaluate_candidate_patch(
+                                patch_text=candidate_patch,
+                                allowed_files=list(allowed_files),
+                                test_paths=list(test_paths),
+                                support_files=list(support_files or []),
+                                timeout_seconds=timeout_seconds,
+                                allow_local_execution=allow_local_candidate_execution,
+                            )
+                            report["candidate_evaluated"] = True
+                            report["candidate_accepted"] = bool(evaluation.get("accepted"))
+                            report["candidate_result"] = evaluation
+                            candidate_evidence = cycle.record_candidate_evaluation(
+                                self.immune_memory, finding, evaluation
+                            ) if self.immune_memory is not None else None
+                            if candidate_evidence is None:
+                                raise RuntimeError("ImmuneMemory unavailable for candidate evidence")
+                            report["candidate_memory_recorded"] = True
+                            report["candidate_evidence_id"] = candidate_evidence["evidence_id"]
+                            report["candidate_incident_id"] = candidate_evidence["incident_id"]
+
+                            if self.sis_integrity is None:
+                                raise RuntimeError("SISIntegrity unavailable for candidate anchor")
+                            candidate_item = next(
+                                (item for item in self.immune_memory.list_evidence(
+                                    incident_id=candidate_evidence["incident_id"]
+                                ) if item.get("evidence_id") == candidate_evidence["evidence_id"]),
+                                None,
+                            )
+                            if candidate_item is None:
+                                raise RuntimeError("Candidate evidence could not be retrieved")
+                            self.sis_integrity.anchor_evidence(candidate_item)
+                            self.sis_integrity_error = None
+                            report["candidate_sis_anchored"] = True
+                        except Exception as exc:
+                            report["errors"].append(
+                                f"Candidate evaluation failed: {type(exc).__name__}: {exc}"
+                            )
                 else:
                     report["result"] = "reproduction_not_confirmed"
 
@@ -4417,6 +4994,11 @@ class Symbiont:
                 report.get("result") == "reproduction_confirmed"
                 and report["memory_recorded"]
                 and report["sis_anchored"]
+                and (not candidate_requested or (
+                    report["candidate_evaluated"]
+                    and report["candidate_memory_recorded"]
+                    and report["candidate_sis_anchored"]
+                ))
                 and not report["errors"]
             )
         except Exception as exc:
@@ -4608,6 +5190,7 @@ class Symbiont:
 
             # Закрываем ресурсы независимо: ошибка одного не пропускает остальные.
             components = (
+                ("continuity_shadow", getattr(self, "continuity_shadow", None)),
                 ("sis_integrity", self.sis_integrity),
                 ("immune_memory", self.immune_memory),
                 ("memory", self.memory),

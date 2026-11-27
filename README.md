@@ -126,6 +126,8 @@ export SYMBIONT_SCP1_P2P=1
 
 Discovery and trust remain separate concepts.
 
+The current Stage 1B integration adds authenticated UDP Beacon discovery, mutual TCP handshake, TSK owner-confirmed Core-to-Node binding, peer and session checks, and replay protection. Discovery alone does not grant trust. The integration does not provide payload encryption or forward secrecy.
+
 ### SMSA
 
 SMSA provides an additional security and authorization boundary for supported capabilities and settlement operations.

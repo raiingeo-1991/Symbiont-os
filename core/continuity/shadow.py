@@ -15,18 +15,29 @@ from .identity import ContinuityIdentity
 from .ledger import ContinuityLedger, ContinuityVerificationError
 from .recovery import ContinuityRecovery
 from .state import ContinuityState
+from core.sss.sis_witness import PersistentWitness
 
 
 class ContinuityShadow:
     VERSION = "SCA-1-SHADOW/1"
 
     @staticmethod
-    def enabled_from_env() -> bool:
-        return os.getenv("SYMBIONT_SCA1_SHADOW", "0").strip().lower() in {
+    def witness_enabled_from_env() -> bool:
+        return os.getenv("SYMBIONT_SCA1_WITNESS", "0").strip().lower() in {
             "1", "true", "yes", "on"
         }
 
-    def __init__(self, root: Path, core_identity: Any):
+    @staticmethod
+    def enabled_from_env() -> bool:
+        enabled = os.getenv("SYMBIONT_SCA1_SHADOW", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        return enabled or ContinuityShadow.witness_enabled_from_env()
+
+    def __init__(
+        self, root: Path, core_identity: Any,
+        witness: Optional[PersistentWitness] = None,
+    ):
         self.root = Path(root)
         self.path = self.root / "continuity"
         self.path.mkdir(parents=True, exist_ok=True)
@@ -45,7 +56,20 @@ class ContinuityShadow:
                 version="SCA-1",
             )
 
-        self.ledger = ContinuityLedger(self.path / "ledger.jsonl")
+        # Core integration must cryptographically sign every SCA-1 event with
+        # the same Ed25519 NodeIdentity that owns this continuity identity.
+        # The unsigned legacy fixture path is retained only for isolated tests.
+        ledger_signer = (
+            core_identity
+            if callable(getattr(core_identity, "identity", None))
+            and self.identity.algorithm == "Ed25519"
+            else None
+        )
+        self.ledger = ContinuityLedger(
+            self.path / "ledger.jsonl",
+            signer=ledger_signer,
+            witness=witness,
+        )
         self.recovery = ContinuityRecovery(
             self.path / "state.json",
             self.ledger,
@@ -264,6 +288,7 @@ class ContinuityShadow:
         self._last_core_event_id = core_event_id
 
     def status(self) -> Dict[str, Any]:
+        witness_status = self.ledger.witness_status()
         return {
             "enabled": True,
             "mode": "shadow",
@@ -277,10 +302,21 @@ class ContinuityShadow:
             "p2p_version": self.state.p2p_version,
             "ledger_events": len(self.ledger.events()),
             "ledger_valid": self.ledger.tamper_check(),
-            "health": "degraded" if self._failed else "healthy",
+            "witness_enabled": witness_status["enabled"],
+            "witness_valid": witness_status["valid"],
+            "witness_state": witness_status["state"],
+            "witness_error": witness_status.get("error"),
+            "health": (
+                "degraded"
+                if self._failed or (witness_status["enabled"] and not witness_status["valid"])
+                else "healthy"
+            ),
             "error_count": self._error_count,
             "last_error": self._last_error,
             "last_core_event_id": self._last_core_event_id,
             "core_mutation": False,
         }
+
+    def close(self) -> None:
+        self.ledger.close()
 

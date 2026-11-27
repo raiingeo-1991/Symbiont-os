@@ -57,6 +57,8 @@ SCA-1 работает как опциональный Shadow-контур:
 
 Проверены SCP-1 identity, подписи, replay protection, trusted nodes, Zero-Trust состояние и интеграция с P2P.
 
+Stage 1B дополнительно покрывает взаимный TCP handshake, UDP Beacon authentication, TSK owner-confirmed Core-to-Node binding, fingerprint checks, sender/response/session binding, отказ от legacy TCP в SCP-1 P2P mode и синхронизацию отзыва TSK-доверия.
+
 Проверена совместимость PermissionGate и SMSA.
 
 ### P2P

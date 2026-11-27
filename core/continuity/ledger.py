@@ -8,6 +8,7 @@ import os
 import threading
 
 from .events import ContinuityEvent
+from core.sss.sis_witness import Anchor, PersistentWitness, WitnessError
 
 
 class ContinuityVerificationError(Exception):
@@ -22,10 +23,12 @@ class ContinuityLedger:
         path: Optional[str] = None,
         signer: Optional[Any] = None,
         max_event_age: Optional[int] = None,
+        witness: Optional[PersistentWitness] = None,
     ):
         self.path = Path(path) if path else None
         self.signer = signer
         self.max_event_age = max_event_age
+        self.witness = witness
         self._events: List[ContinuityEvent] = []
         self._lock = threading.RLock()
         self._write_failed = False
@@ -52,6 +55,8 @@ class ContinuityLedger:
                 raise ContinuityVerificationError(
                     "ledger missing while high-water anchor exists"
                 )
+            if self.witness is not None:
+                self._check_witness(recover_pending=True)
             return
 
         try:
@@ -69,6 +74,57 @@ class ContinuityLedger:
         self._events = events
         self.verify()
         self._verify_high_water()
+        if self.witness is not None:
+            self._check_witness(recover_pending=True)
+
+    def _head_anchor(self) -> Anchor:
+        latest = self._events[-1] if self._events else None
+        if latest is None:
+            return Anchor(0, "0" * 64)
+        return Anchor(latest.event_sequence, latest.content_hash())
+
+    def _check_witness(self, *, recover_pending: bool = False) -> str:
+        if self.witness is None:
+            return "DISABLED"
+
+        local = self._head_anchor()
+        current = self.witness.current
+        pending = self.witness.pending
+
+        if pending is not None:
+            expected, candidate = pending
+            if current != expected:
+                raise WitnessError("Pending witness transition has stale expected state")
+            if local == candidate:
+                if recover_pending:
+                    self.witness.commit(candidate)
+                    return "RECOVERED_COMMIT"
+                return "RECOVERY_REQUIRED"
+            if local == expected:
+                if recover_pending:
+                    self.witness.abort(expected, candidate)
+                    return "RECOVERED_ABORT"
+                return "RECOVERY_REQUIRED"
+            raise WitnessError("Pending witness transition does not match the verified SCA-1 ledger")
+
+        result = self.witness.compare_local(local)
+        if result != "MATCH":
+            raise WitnessError(f"SCA-1 Ledger/Witness mismatch: {result}")
+        return result
+
+    def witness_status(self) -> dict:
+        if self.witness is None:
+            return {"enabled": False, "valid": None, "state": "DISABLED"}
+        try:
+            state = self._check_witness(recover_pending=False)
+            return {"enabled": True, "valid": state == "MATCH", "state": state}
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "valid": False,
+                "state": "ERROR",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     def _fsync_parent(self, path: Path) -> None:
         """Persist directory-entry changes where the filesystem supports it."""
@@ -227,6 +283,12 @@ class ContinuityLedger:
             if previous and event.previous_event_hash != previous.content_hash():
                 raise ContinuityVerificationError("event chain construction failed")
 
+            previous_anchor = self._head_anchor()
+            candidate_anchor = Anchor(event.event_sequence, event.content_hash())
+            if self.witness is not None:
+                self._check_witness(recover_pending=True)
+                self.witness.prepare(previous_anchor, candidate_anchor)
+
             self._events.append(event)
             try:
                 self._append_disk(event)
@@ -237,7 +299,20 @@ class ContinuityLedger:
                 self._write_failure_reason = (
                     f"{type(exc).__name__}: {exc}"
                 )
+                # Keep the witness prepare record. On restart, a verified old
+                # ledger head permits an explicit abort; a partial/corrupt
+                # disk write remains fail-closed.
                 raise
+
+            if self.witness is not None:
+                try:
+                    self.witness.commit(candidate_anchor)
+                except Exception as exc:
+                    self._write_failed = True
+                    self._write_failure_reason = (
+                        f"witness commit failed: {type(exc).__name__}: {exc}"
+                    )
+                    raise
             return event
 
     def events(self) -> List[ContinuityEvent]:
@@ -283,6 +358,10 @@ class ContinuityLedger:
             return True
         except ContinuityVerificationError:
             return False
+
+    def close(self) -> None:
+        if self.witness is not None:
+            self.witness.close()
 
     def export(self) -> List[Dict[str, Any]]:
         return [e.as_dict() for e in self.events()]

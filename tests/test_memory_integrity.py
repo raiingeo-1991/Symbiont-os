@@ -174,3 +174,68 @@ class MemoryIntegrityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_memory_journal_outbox_recovers_after_journal_failure(tmp_path):
+    journal_path = tmp_path / "events.log"
+    journal = EventJournal(journal_path)
+    vault = MemoryVault(tmp_path / "memory.sqlite3", journal)
+
+    original_append = journal.append
+    calls = {"count": 0}
+
+    def fail_once(event_type, payload):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("simulated journal disk failure")
+        return original_append(event_type, payload)
+
+    journal.append = fail_once
+    memory_id = vault.remember("Outbox recovery record", kind="principle")
+    assert vault.journal_outbox_status()["pending"] == 1
+    assert vault.db.execute(
+        "SELECT 1 FROM memories WHERE memory_id = ?", (memory_id,)
+    ).fetchone() is not None
+    vault.close()
+
+    restarted = MemoryVault(tmp_path / "memory.sqlite3", EventJournal(journal_path))
+    try:
+        assert restarted.journal_outbox_status()["pending"] == 0
+        events = EventJournal(journal_path).all_events()
+        matching = [
+            event for event in events
+            if event.get("type") == "memory.created"
+            and event.get("payload", {}).get("memory_id") == memory_id
+        ]
+        assert len(matching) == 1
+    finally:
+        restarted.close()
+
+
+def test_memory_journal_outbox_does_not_duplicate_after_append_before_ack(tmp_path):
+    journal_path = tmp_path / "events.log"
+    journal = EventJournal(journal_path)
+    vault = MemoryVault(tmp_path / "memory.sqlite3", journal)
+
+    original_append = journal.append
+    def append_then_fail_ack(event_type, payload):
+        original_append(event_type, payload)
+        raise OSError("simulated crash after journal append")
+    journal.append = append_then_fail_ack
+
+    memory_id = vault.remember("Outbox duplicate protection", kind="general")
+    assert vault.journal_outbox_status()["pending"] == 1
+    vault.close()
+
+    restarted = MemoryVault(tmp_path / "memory.sqlite3", EventJournal(journal_path))
+    try:
+        events = EventJournal(journal_path).all_events()
+        matching = [
+            event for event in events
+            if event.get("type") == "memory.created"
+            and event.get("payload", {}).get("memory_id") == memory_id
+        ]
+        assert len(matching) == 1
+        assert restarted.journal_outbox_status()["pending"] == 0
+    finally:
+        restarted.close()

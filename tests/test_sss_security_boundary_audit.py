@@ -78,3 +78,23 @@ def test_incoming_scp1_rejects_sender_signer_mismatch_over_live_tcp(tmp_path):
         if conn is not None:
             conn.close()
         _close(pair)
+
+
+def test_core_payment_permission_is_separate_and_denied_by_default(tmp_path, monkeypatch):
+    import symbiont_core as core
+
+    monkeypatch.setenv("SYMBIONT_SMSA", "1")
+    monkeypatch.setenv("SYMBIONT_SCA1_SHADOW", "0")
+    sym = core.Symbiont(tmp_path / "sym", show_recovery_phrase=False)
+    try:
+        assert sym.permissions.check("payment_execute") is False
+        assert sym.smsa is not None
+        assert sym.smsa.check("payment.execute") is False
+
+        sym.permissions.allow("payment_execute")
+        assert sym.smsa.check("payment.execute") is True
+
+        sym.permissions.deny("payment_execute")
+        assert sym.smsa.check("payment.execute") is False
+    finally:
+        sym.close()

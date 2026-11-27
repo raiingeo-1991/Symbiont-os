@@ -137,7 +137,11 @@ def test_runner_reproduces_economy_journal_failure_in_isolation(tmp_path):
     assert result["persisted_balance"] == 10.0
     assert result["balance_after_restart"] == 10.0
     assert result["journal_valid"] is True
-    assert result["journal_event_count"] == 0
+    assert result["journal_event_count"] == 1
+    assert result["economy_credit_event_count"] == 1
+    assert result["outbox_pending_before_restart"] == 1
+    assert result["outbox_pending_after_restart"] == 0
+    assert result["scenario"] == "credit_outbox_recovery_after_journal_failure"
     assert result["isolation"] == "temporary_directory"
 
 
@@ -150,8 +154,12 @@ def test_runner_result_can_be_recorded_as_immune_evidence(tmp_path):
     )
     finding = cycle.discover_economy_write_order()
     credit_finding = next(
-        item for item in finding["findings"]
-        if item["method"] == "credit"
+        (item for item in finding["findings"] if item["method"] == "credit"),
+        {
+            "rule_id": "ECONOMY-OUTBOX-RECOVERY",
+            "method": "credit",
+            "source_sha256": finding["source_sha256"],
+        },
     )
     credit_finding["source_sha256"] = finding["source_sha256"]
 
@@ -171,3 +179,39 @@ def test_runner_result_can_be_recorded_as_immune_evidence(tmp_path):
         assert memory.verify() == (True, 1)
     finally:
         memory.close()
+
+
+def test_candidate_evaluation_is_recorded_as_idempotent_fact(tmp_path):
+    from core.sss.immune_memory import ImmuneMemory
+
+    cycle = ImmuneCycle(tmp_path, tmp_path / "reports")
+    memory = ImmuneMemory(tmp_path / "immune.sqlite3")
+    finding = {"rule_id": "RULE-X", "method": "credit"}
+    evaluation = {
+        "patch_sha256": "a" * 64,
+        "original_sha256": {"app.py": "b" * 64},
+        "test_paths": ["test_app.py"],
+        "support_files": [],
+        "accepted": False,
+        "reason": "candidate_tests_failed_or_timed_out",
+        "baseline_tests": {"returncode": 1, "passed": False, "timed_out": False},
+        "tests": {"returncode": 1, "passed": False, "timed_out": False},
+        "live_files_unchanged": True,
+    }
+    try:
+        first = cycle.record_candidate_evaluation(memory, finding, evaluation)
+        second = cycle.record_candidate_evaluation(memory, finding, evaluation)
+        assert first == second
+        item = memory.list_evidence(incident_id=first["incident_id"])[0]
+        assert item["evidence_kind"] == "fact"
+        assert item["source_event_type"] == "immune.candidate.evaluated"
+        assert item["details"]["accepted"] is False
+        assert memory.verify() == (True, 1)
+    finally:
+        memory.close()
+
+
+def test_live_project_pytest_runner_is_disabled(tmp_path):
+    cycle = ImmuneCycle(tmp_path, tmp_path / "reports")
+    with pytest.raises(RuntimeError, match="Live-project pytest execution is disabled"):
+        cycle.run_pytest(["test_something.py"])

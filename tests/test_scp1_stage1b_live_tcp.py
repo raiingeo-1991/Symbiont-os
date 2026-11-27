@@ -23,7 +23,14 @@ def _node(core_id, core_key, node_identity, tsk, remote_core_id, remote_core_key
     peers.upsert(remote_core_id, remote_core_key, "127.0.0.1", remote_port,
                  node_id=remote_node.node_id,
                  node_public_key_fingerprint=hashlib.sha256(remote_node.public_key).hexdigest())
-    return SimpleNamespace(identity=FakeCoreIdentity(core_id, core_key), peers=peers, tsk=tsk)
+    permissions = core.PermissionGate()
+    permissions.allow("network_send")
+    permissions.allow("network_receive")
+    permissions.allow("task_execution")
+    return SimpleNamespace(
+        identity=FakeCoreIdentity(core_id, core_key), peers=peers, tsk=tsk,
+        permissions=permissions,
+    )
 
 
 def _bind(tsk, core_id, core_key, remote_node):

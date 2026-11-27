@@ -692,6 +692,8 @@ export SYMBIONT_SCP1_P2P=1
 
 Trusted nodes are configured separately.
 
+The current Stage 1B integration includes authenticated UDP Beacon discovery, mutual TCP handshake (`HELLO → CHALLENGE → FINISH → ESTABLISHED`), TSK owner-confirmed Core-to-Node binding, fingerprint checks, sender and session binding, and persistent replay protection. Discovery does not grant trust. Environment-configured trusted nodes remain a separate trust source. The integration does not provide payload encryption or forward secrecy.
+
 ## SMSA Security
 
 SMSA provides an additional security and authorization boundary for supported capabilities and settlement operations.
